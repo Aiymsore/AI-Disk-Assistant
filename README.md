@@ -253,8 +253,4 @@ coverage report -m
 - 构建 40 条人工标注的模拟元数据评测集，比较本地规则、纯 AI 与混合方案，并以危险误判数作为核心安全指标。
 - 编写覆盖双 API 协议和核心安全路径的单元测试，覆盖率超过 80%，通过 GitHub Actions 进行多平台测试、代码检查、包构建和 Windows EXE 发布。
 
-详细面试讲法见 [`docs/interview_notes.md`](docs/interview_notes.md)，GIF 录制见 [`docs/GIF_GUIDE.md`](docs/GIF_GUIDE.md)。
 
-## License
-
-MIT
