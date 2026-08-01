@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and runtime cache
+.env
+*.key
+.cache/
+
+# Build output
+build/
+dist/
+*.spec
+*.exe
+
+# Runtime reports and demo files
+reports/*.csv
+reports/*.json
+reports/*.html
+demo/sample_disk/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,56 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build CLI executable
+        run: pyinstaller --clean --noconfirm --onefile --name AI-Disk-Assistant main.py
+      - name: Build GUI executable
+        run: pyinstaller --clean --noconfirm --onefile --windowed --name AI-Disk-Assistant-GUI gui.py
+      - name: Prepare release package
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { 'dev' }
+          $folder = "release/AI-Disk-Assistant-$version-Windows"
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+          Copy-Item dist/AI-Disk-Assistant.exe $folder/
+          Copy-Item dist/AI-Disk-Assistant-GUI.exe $folder/
+          Copy-Item .env.example $folder/
+          Copy-Item README.md $folder/
+          Copy-Item LICENSE $folder/
+          Copy-Item SECURITY.md $folder/
+          Copy-Item docs/SETUP_GUIDE.md $folder/
+          Compress-Archive -Path "$folder/*" -DestinationPath "release/AI-Disk-Assistant-$version-Windows.zip"
+          Get-FileHash dist/AI-Disk-Assistant.exe -Algorithm SHA256 | Format-List | Out-File release/SHA256SUMS.txt
+          Get-FileHash dist/AI-Disk-Assistant-GUI.exe -Algorithm SHA256 | Format-List | Out-File release/SHA256SUMS.txt -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-Disk-Assistant-Windows
+          path: |
+            dist/AI-Disk-Assistant.exe
+            dist/AI-Disk-Assistant-GUI.exe
+            release/*.zip
+            release/SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/AI-Disk-Assistant.exe
+            dist/AI-Disk-Assistant-GUI.exe
+            release/*.zip
+            release/SHA256SUMS.txt
