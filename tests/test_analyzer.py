@@ -58,7 +58,7 @@ class AnalyzerSmokeTests(unittest.TestCase):
             )
         # 启发式贪心圈选：other 体积最大先圈，big 次之；big 子目录多 → 下钻，
         # 叶子（体积前 2 的 sub7/sub6）才是扫描目标，散文件单独评审不漏扫。
-        scanned = {area.path.rsplit("\\", 1)[-1] for area in result.areas}
+        scanned = {area.path.replace("\\", "/").rsplit("/", 1)[-1] for area in result.areas}
         self.assertEqual(scanned, {"sub6", "sub7", "other"})
         # big 被下钻：叶子是体积前 2 的子目录（sub7/sub6），散文件单独评审不漏扫。
         candidate_paths = [item.metadata.path for item in result.candidates]

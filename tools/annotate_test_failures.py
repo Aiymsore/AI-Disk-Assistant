@@ -31,9 +31,15 @@ def main() -> None:
         sections.append((current_file, current))
 
     for file_name, lines in sections:
-        body_lines = lines[-LINES_PER_FILE:]
+        picked: list[str] = []
+        for index, line in enumerate(lines):
+            if line.startswith(("FAIL:", "ERROR:")):
+                picked.extend(lines[max(0, index - 2) : index + LINES_PER_FILE])
+        if not picked:
+            continue
+        # 去重保序后合并为一条多行注解（%0A 转义换行，绕开每步 10 条注解的上限）
         body = "%0A".join(
-            line.replace("%", "%25").replace("\r", "") for line in body_lines
+            line.replace("%", "%25").replace("\r", "") for line in dict.fromkeys(picked)
         )
         print(f"::error title=[{file_name}]::{body}")
 
