@@ -46,6 +46,9 @@ jobs:
             done
           fi
           exit "$status"
+      - name: Emit failure details
+        if: failure()
+        run: python tools/annotate_test_failures.py
       - name: Coverage report
         if: always()
         run: python -m coverage report --fail-under=75 || true
