@@ -47,10 +47,13 @@ def _signals_from_facts(
     is_small = size_bytes <= policy.small_file_size
     is_big = size_bytes >= policy.big_file_size
     try:
-        relative_parts = Path(path_text).relative_to(root).parts
+        relative_text = str(Path(path_text).relative_to(root))
     except ValueError:
-        relative_parts = Path(path_text).parts
-    path_parts = {part.casefold() for part in relative_parts}
+        relative_text = path_text
+    # 分隔符归一：Linux 上 Path 不把反斜杠当分隔符，纯字符串切分保证上下文匹配跨平台一致。
+    path_parts = {
+        part.casefold() for part in relative_text.replace("\\", "/").split("/") if part
+    }
     in_safe_context = bool(path_parts & SAFE_CONTEXT_NAMES)
 
     reasons: list[str] = []

@@ -149,9 +149,17 @@ class Inventory:
             ).fetchone()
         return int(row[0]), int(row[1])
 
+    @staticmethod
+    def _subtree_prefix(directory: str) -> str:
+        """子树前缀：保留调用方路径自身的分隔符风格（Windows 反斜杠 / 测试环境正斜杠）。"""
+        if directory.endswith(("\\", "/")):
+            return directory
+        separator = "\\" if "\\" in directory else "/"
+        return directory + separator
+
     def extension_stats(self, snapshot_id: int, directory: str, limit: int = 50) -> list[dict[str, object]]:
         """某个目录子树内按后缀聚合（大小降序）——扩展名分类面板用。"""
-        prefix = directory.rstrip("\\") + "\\"
+        prefix = self._subtree_prefix(directory)
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
@@ -316,7 +324,7 @@ class Inventory:
 
     def files_under(self, snapshot_id: int, directory: str) -> list[FileRow]:
         """某个目录子树内的全部文件（含各级子目录）——叶子区域评分用。"""
-        prefix = directory.rstrip("\\") + "\\"
+        prefix = self._subtree_prefix(directory)
         return self._file_rows(
             "SELECT path, name, suffix, size_bytes, mtime_ns FROM files "
             "WHERE snapshot_id = ? AND substr(path, 1, ?) = ?",

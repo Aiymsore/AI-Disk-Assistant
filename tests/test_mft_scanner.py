@@ -393,7 +393,8 @@ class SyntheticVolumeTests(unittest.TestCase):
                 snapshot_id, file_count = m.snapshot_volume("C:", inventory)
                 self.assertEqual(file_count, 5)
                 dirs = {
-                    Path(row.path).name: row.total_size
+                    # 路径由 SQL 重建为反斜杠风格，Linux 上 Path 不识别，须手切
+                    row.path.rsplit("\\", 1)[-1]: row.total_size
                     for row in inventory.top_dirs(snapshot_id, 10, exclude="C:\\")
                 }
                 self.assertEqual(dirs["big"], 110)  # 递归聚合：sub 的 100 + 散文件 10
