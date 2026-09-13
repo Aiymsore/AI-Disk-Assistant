@@ -61,3 +61,26 @@
 - 常量收拢：后缀集合 2 组同名异值消除、默认值 4 类（策略/UA/缓存路径/版本号）归一
 - 全部 18 个文件变更：+313 / -147 行（净增主要为中文注释与两份文档）
 - 27 个测试全绿；CLI/GUI 行为不变（仅版本号显示由 1.3 → 1.3.0）
+
+## F. remaster 后复审（2026-09-13）
+
+> MFT 管线、快照回收、GUI 重设计、品牌化（P4Disk4P）落地后的第二轮全量审视。
+
+### 死代码（✅ 本轮已删）
+
+| # | 原位置 | 问题 | 处置 |
+|---|---|---|---|
+| F1 | `gui.py` `_start_ai_test` 双重定义（旧 623 行与新 919 行） | 后定义静默覆盖前者，功能虽同但属隐患 | ✅ 删除重复副本，保留一处 |
+| F2 | `models.py` `ScanResult` 数据类 | 全仓零引用（分析层改用 `AnalyzeResult` 后遗留） | ✅ 删除 |
+| F3 | `scanner.py` `_candidate_signals` | 零调用方（docstring 声称"仅诊断脚本使用"，诊断脚本实际也已改走快照事实评分） | ✅ 删除 |
+| F4 | `safety.py` 用户内容分支的"存档或备份文件"标注 | 压缩包改为守卫放行后该分支不可达 | ✅ 删除 |
+
+### 新增模块的审视（📌 有意保留 / 💡 可合并未执行）
+
+| # | 位置 | 观察 | 处置 |
+|---|---|---|---|
+| F5 | `ai_advisor.suggest_areas` / `review_duplicates` | 各自重复约 20 行"双协议请求构造 + 提取 + 条目校验"，仅提示词/列表键/校验字段不同 | 💡 可合并为共享的 `_structured_list_request()`（需参数化条目解析器）；两处合计 110 行，合并收益中等，暂留 |
+| F6 | `inventory.add_files` / `add_dirs` | 生产管线（snapshot_volume 的 SQL INSERT）已不使用，仅测试 seed 助手调用 | 💡 可移交测试侧；保留的代价是公共 API 面扩大。暂留，若后续无第三方使用再移 |
+| F7 | 每文件 AI 管线 `advise` / `advise_many` / `_get_ai_advices` / `_apply_hybrid_guard` / `metadata_for_ai` | 生产扫描已全部走单元管线，每文件管线仅剩 CLI inspect（单文件产品功能）与 evaluation 基准对照使用 | 📌 有意保留：两者均为产品/评测功能，非冗余 |
+| F8 | `FileMetadata.accessed_time(_ns)` / `device_id` / `file_id`、`AdvisorStats.prompt_tokens` / `completion_tokens` | 不参与判定/展示 | 📌 有意保留（注释已声明）：随报告导出供人工核对、进快照校验键、随 summary JSON 落盘 |
+| F9 | `ADVICE_DELETE_SUFFIXES` ⊂ `SIGNAL_JUNK_SUFFIXES` | 后缀集合重叠 | 📌 有意保留（评分求宽、直判求窄，注释已声明） |

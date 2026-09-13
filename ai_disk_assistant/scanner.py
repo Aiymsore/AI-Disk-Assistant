@@ -89,15 +89,6 @@ def _signals_from_facts(
     return "；".join(dict.fromkeys(reasons)), score, size_bytes
 
 
-def _candidate_signals(path: Path, root: Path, policy: ScanPolicy) -> tuple[str, float, int] | None:
-    """兼容入口：按路径现场 stat 后走事实评分。仅诊断脚本使用，分析管线不走这里。"""
-    try:
-        stat = path.stat()
-    except (PermissionError, OSError):
-        return None
-    return _signals_from_facts(str(path), path.suffix.casefold(), stat.st_size, root, policy)
-
-
 # ── 评审主体：归并判定单元 → AI 判断 → 展开回候选 ─────────────────────────
 def judge_metadata_records(
     metadata_records: list[tuple[FileMetadata, str, float]],

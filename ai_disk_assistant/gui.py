@@ -916,11 +916,6 @@ class DiskAssistantGUI:
         self.ai_config_button.configure(state=state)
         self.review_button.configure(state=state)
 
-    def _start_ai_test(self) -> None:
-        self._set_busy(True)
-        self.status_var.set("正在测试 AI 接口和结构化返回……")
-        threading.Thread(target=self._ai_test_worker, daemon=True).start()
-
     def _poll_events(self) -> None:
         try:
             while True:
