@@ -3,3 +3,4 @@ coverage>=7.6
 ruff>=0.9
 pyinstaller>=6.0
 build>=1.2
+pillow>=11.0

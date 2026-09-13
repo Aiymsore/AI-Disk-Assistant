@@ -18,14 +18,14 @@ build_windows_exe.bat
 脚本会创建或复用 `.venv`，安装 PyInstaller，然后生成：
 
 ```text
-dist/AI-Disk-Assistant.exe
-dist/AI-Disk-Assistant-GUI.exe
+dist/P4Disk4P.exe
+dist/P4Disk4P-GUI.exe
 ```
 
 其中：
 
-- `AI-Disk-Assistant-GUI.exe`：简历展示和普通用户使用的主要版本；
-- `AI-Disk-Assistant.exe`：命令行版本，适合批处理和技术演示。
+- `P4Disk4P-GUI.exe`：简历展示和普通用户使用的主要版本；
+- `P4Disk4P.exe`：命令行版本，适合批处理和技术演示。
 
 发布前应在一台没有 Python 环境的 Windows 电脑或 Windows Sandbox 中测试：
 
