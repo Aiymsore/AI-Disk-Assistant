@@ -1,12 +1,12 @@
-"""解析 tests-output.txt，把每个含 FAIL/ERROR 的测试文件的末尾 traceback 转成 ::error:: 注解。
+"""解析 tests-output.txt，把每个失败测试文件的尾部输出合并成 ::error:: 注解。
 
-CI 诊断工具：job 日志只有仓库管理员能读，而 ::error:: 注解走公开 API 可匿名读取，
-用于在无日志权限时定位 CI 独有的测试失败（如 Linux/3.10 环境差异）。
+CI 诊断工具：job 日志只有仓库管理员能读，而 ::error:: 注解走公开 API 可匿名读取。
+每个文件合并为一条注解（换行用 %0A 转义），避开 GitHub 每步 10 条注解的上限。
 """
 
 from pathlib import Path
 
-LINES_PER_FILE = 10
+LINES_PER_FILE = 12
 
 
 def main() -> None:
@@ -30,14 +30,12 @@ def main() -> None:
     if current:
         sections.append((current_file, current))
 
-    emitted = 0
     for file_name, lines in sections:
-        if not any(line.startswith(("FAIL:", "ERROR:")) for line in lines):
-            continue
-        for line in lines[-LINES_PER_FILE:]:
-            emitted += 1
-            print(f"::error title=diag-{emitted} [{file_name}]:: {line}")
-    print(f"::error::emitted {emitted} annotations for failing files")
+        body_lines = lines[-LINES_PER_FILE:]
+        body = "%0A".join(
+            line.replace("%", "%25").replace("\r", "") for line in body_lines
+        )
+        print(f"::error title=[{file_name}]::{body}")
 
 
 if __name__ == "__main__":
