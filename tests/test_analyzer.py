@@ -123,7 +123,6 @@ class AnalyzerSmokeTests(unittest.TestCase):
         # suggest_areas，但 area_limit=1 且 big 的子目录圈选命中 1 次；合计 3 次）。
         # AI 调用共 2 次：阶段一圈区域 + 重复组判读（.msi 由本地守卫裁决，不耗 AI）。
         self.assertEqual(advisor.stats.api_calls, 2)
-        print("DBG dups:", [(d.verdict, d.comment) for d in result.duplicates])
         self.assertEqual(result.duplicates[0].verdict, "likely")
         self.assertEqual(result.duplicates[0].comment, "同名副本散落")
 
