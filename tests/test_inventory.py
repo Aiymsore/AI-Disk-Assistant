@@ -14,6 +14,9 @@ def seed_snapshot(inventory: Inventory, root: Path, files: list[tuple[str, int]]
 
     files: [(相对路径, size)]；dirs: 相对目录列表。
     """
+    # 统一长短路径：GitHub runner 的 TEMP 返回 8.3 短名（RUNNER~1），若文件与目录
+    # 一边 resolve 一边不 resolve，父子路径匹配会全部失灵（聚合为 0、下钻为空）。
+    root = Path(root).resolve()
     snapshot_id = inventory.begin_snapshot(str(root))
     file_rows = []
     dir_rows = []
