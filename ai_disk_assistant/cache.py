@@ -1,3 +1,8 @@
+"""缓存层：SQLite 建议缓存（key = 模型+隐私模式+文件快照的 sha256）。
+
+仅被 ai_advisor.py 使用；同一文件在配置不变时避免重复调用 AI。
+"""
+
 from __future__ import annotations
 
 from contextlib import closing
@@ -74,7 +79,3 @@ class AdviceCache:
                     json.dumps(advice.to_dict(), ensure_ascii=False, sort_keys=True),
                 ),
             )
-
-    def clear(self) -> None:
-        with self._lock, closing(self._connect()) as connection, connection:
-            connection.execute("DELETE FROM advice_cache")

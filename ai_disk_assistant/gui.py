@@ -1,3 +1,10 @@
+"""图形界面层（Tkinter）：扫描控制、结果列表、AI 配置对话框、回收站操作。
+
+架构要点：所有耗时任务（扫描/AI 测试/移回收站）都在后台线程执行，
+通过事件队列 + _poll_events 轮询把结果送回主线程刷新 UI，避免界面卡死。
+由根目录 gui.py 调起，pyproject.toml 注册为 `ai-disk-assistant-gui` 命令。
+"""
+
 from __future__ import annotations
 
 import os
@@ -5,7 +12,6 @@ import queue
 import subprocess
 import sys
 import threading
-from dataclasses import replace
 from pathlib import Path
 from tkinter import (
     BOTH,
@@ -23,9 +29,12 @@ from tkinter import (
     ttk,
 )
 
-from .ai_advisor import HybridAdvisor
+from . import __version__
+from .ai_advisor import build_advisor
 from .cleaner import CleanerUnavailable, move_to_trash, select_auto_candidates
 from .config import (
+    DEFAULT_CACHE_PATH,
+    DEFAULT_USER_AGENT,
     Settings,
     default_env_path,
     normalize_api_style,
@@ -34,10 +43,15 @@ from .config import (
 )
 from .metadata import format_size
 from .models import Candidate
-from .report import build_summary, default_report_path, write_csv, write_html_report, write_summary_json
+from .report import write_all_reports
 from .scanner import ScanPolicy, scan_with_stats
 
+# GUI 结果列表保留的候选上限。与 CLI 默认值（ScanPolicy.max_candidates = 5000）不同是有意设计：
+# 扫描完成后所有候选一次性插入 Tkinter 树控件，数量过大会明显卡住界面。
+GUI_MAX_CANDIDATES = 1000
 
+
+# ── 通用小工具 ───────────────────────────────────────────────────────────
 def _open_path(path: Path) -> None:
     if sys.platform.startswith("win"):
         os.startfile(path)  # type: ignore[attr-defined]
@@ -47,6 +61,7 @@ def _open_path(path: Path) -> None:
         subprocess.run(["xdg-open", str(path)], check=False)
 
 
+# ── AI 配置对话框：.env 文件的图形编辑器 ─────────────────────────────────
 class AIConfigDialog:
     """Small GUI editor for the runtime ``.env`` AI configuration."""
 
@@ -161,7 +176,7 @@ class AIConfigDialog:
         key = self.key_var.get().strip()
         base_url = self.base_url_var.get().strip().rstrip("/")
         model = self.model_var.get().strip()
-        cache_path = self.cache_path_var.get().strip() or ".cache/ai_advice.sqlite3"
+        cache_path = self.cache_path_var.get().strip() or DEFAULT_CACHE_PATH
 
         if not key:
             messagebox.showerror("配置错误", "API Key 不能为空。", parent=self.window)
@@ -195,7 +210,7 @@ class AIConfigDialog:
                 "AI_RETRY_BACKOFF": str(retry_backoff),
                 "AI_CACHE_PATH": cache_path,
                 "AI_PRIVACY_MODE": self.privacy_var.get(),
-                "AI_USER_AGENT": "AI-Disk-Assistant/1.3",
+                "AI_USER_AGENT": DEFAULT_USER_AGENT,
             }
         )
         privacy = self.privacy_var.get()
@@ -204,10 +219,11 @@ class AIConfigDialog:
         self.on_saved(privacy, test_after_save)
 
 
+# ── 主窗口 ───────────────────────────────────────────────────────────────
 class DiskAssistantGUI:
     def __init__(self, root: Tk) -> None:
         self.root = root
-        self.root.title("AI Disk Assistant v1.3")
+        self.root.title(f"AI Disk Assistant v{__version__}")
         self.root.geometry("1180x740")
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.last_html: Path | None = None
@@ -221,8 +237,8 @@ class DiskAssistantGUI:
         self.selection_var = StringVar(value="未选择文件。")
         self.use_ai_var = BooleanVar(value=True)
         self.privacy_var = StringVar(value="balanced")
-        self.old_days_var = StringVar(value="180")
-        self.ai_limit_var = StringVar(value="80")
+        self.old_days_var = StringVar(value=str(ScanPolicy().old_days))
+        self.ai_limit_var = StringVar(value=str(ScanPolicy().ai_limit))
 
         self._build()
         self.root.after(100, self._poll_events)
@@ -373,11 +389,12 @@ class DiskAssistantGUI:
         privacy = self.privacy_var.get()
         threading.Thread(target=self._ai_test_worker, args=(privacy,), daemon=True).start()
 
+    # ── 后台任务：在 worker 线程中执行，结果一律经事件队列回主线程 ─────────
     def _ai_test_worker(self, privacy: str) -> None:
         try:
-            settings = replace(Settings.from_env(), ai_privacy_mode=privacy)
-            advisor = HybridAdvisor(settings, enable_ai=True)
+            advisor = build_advisor(enable_ai=True, privacy_mode=privacy)
             advice = advisor.probe()
+            settings = advisor.settings
             self.events.put(("ai_test_done", (settings.ai_api_style, settings.ai_model, advice, advisor.stats)))
         except Exception as exc:
             self.events.put(("ai_test_error", exc))
@@ -386,22 +403,19 @@ class DiskAssistantGUI:
         self, root_path: Path, old_days: int, ai_limit: int, use_ai: bool, privacy: str
     ) -> None:
         try:
-            settings = replace(Settings.from_env(), ai_privacy_mode=privacy)
-            advisor = HybridAdvisor(settings, enable_ai=use_ai)
+            advisor = build_advisor(enable_ai=use_ai, privacy_mode=privacy)
             result = scan_with_stats(
                 root_path,
                 advisor,
-                ScanPolicy(old_days=old_days, ai_limit=ai_limit, max_candidates=1000),
+                ScanPolicy(old_days=old_days, ai_limit=ai_limit, max_candidates=GUI_MAX_CANDIDATES),
                 progress=lambda count: self.events.put(("progress", count)),
             )
-            csv_path = write_csv(result.candidates, default_report_path("csv"))
-            summary = build_summary(result.candidates, result.stats, advisor.stats.to_dict())
-            summary_path = write_summary_json(summary, default_report_path("summary.json"))
-            html_path = write_html_report(summary, default_report_path("html"))
-            self.events.put(("done", (result, advisor.stats, csv_path, summary_path, html_path)))
+            reports = write_all_reports(result.candidates, result.stats, advisor.stats.to_dict())
+            self.events.put(("done", (result, advisor.stats, reports.csv, reports.summary, reports.html)))
         except Exception as exc:
             self.events.put(("error", exc))
 
+    # ── 选择与回收站 ─────────────────────────────────────────────────────
     def _select_recommended(self) -> None:
         recommended = set(id(candidate) for candidate in select_auto_candidates(self.row_candidates.values()))
         item_ids = [
@@ -453,6 +467,8 @@ class DiskAssistantGUI:
         if not messagebox.askyesno("确认移入回收站", warning):
             return
 
+        # 回收站二次确认：GUI 用对话框、CLI 用终端口令，两处范式不同故各自实现，
+        # 但口令约定（TRASH）与"先复核后移动"的流程保持一致。
         confirmation = simpledialog.askstring(
             "二次确认",
             "此操作不是永久删除，但会修改文件位置。\n请输入 TRASH 继续：",
@@ -478,13 +494,11 @@ class DiskAssistantGUI:
         if self.last_scan_stats is None:
             raise RuntimeError("缺少扫描统计信息，请重新扫描。")
         self.last_scan_stats.retained_candidates = len(self.current_candidates)
-        csv_path = write_csv(self.current_candidates, default_report_path("csv"))
-        summary = build_summary(self.current_candidates, self.last_scan_stats, self.last_ai_stats)
-        write_summary_json(summary, default_report_path("summary.json"))
-        html_path = write_html_report(summary, default_report_path("html"))
-        self.last_html = Path(html_path)
-        return Path(csv_path), Path(html_path)
+        reports = write_all_reports(self.current_candidates, self.last_scan_stats, self.last_ai_stats)
+        self.last_html = reports.html
+        return reports.csv, reports.html
 
+    # ── 事件轮询：主线程每 100ms 消费一次后台线程投递的事件 ───────────────
     def _poll_events(self) -> None:
         try:
             while True:

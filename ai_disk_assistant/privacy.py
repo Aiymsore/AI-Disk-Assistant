@@ -1,3 +1,9 @@
+"""隐私保护层：决定发送给 AI 的字段范围（strict/balanced/full 三档）。
+
+被 config.py（Settings 校验）与 ai_advisor.py（请求前裁剪）使用；
+safety.py 提供路径分词工具，本层不做任何安全判定。
+"""
+
 from __future__ import annotations
 
 import os

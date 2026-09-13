@@ -1,3 +1,10 @@
+"""AI 决策层：混合顾问 HybridAdvisor——本地安全规则优先，AI 仅做建议且失败可降级。
+
+职责链：请求前隐私裁剪（privacy）→ 缓存查询（cache）→ 批量 HTTP 调用（重试/二分降级）→
+严格校验 AI 返回（_validate_advice）→ 混合守卫降级（_apply_hybrid_guard）。
+被 scanner.py（扫描时批量判断）、cli.py / gui.py（经 build_advisor 构造）使用。
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,17 +12,25 @@ import re
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import islice
 from typing import Any, Iterable, Sequence
 
 from .cache import AdviceCache
 from .config import Settings
-from .models import ADVICE_LEVELS, PURPOSES, Advice, FileMetadata
+from .models import (
+    ADVICE_LEVELS,
+    PURPOSES,
+    REASON_MAX_LENGTH,
+    Advice,
+    FileMetadata,
+    safe_fallback_advice,
+)
 from .privacy import metadata_for_ai
 from .safety import is_auto_delete_eligible, local_safety_guard
 
 
+# ── 系统提示词：purpose / advice_level 的枚举清单与 models.py 的常量保持一致 ──
 SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的文件安全建议模块。
 你只能根据文件路径、文件名、后缀、大小和时间等元数据判断，不能假设读取过文件内容。
 
@@ -35,6 +50,7 @@ advice_level 只能是：建议删除、谨慎删除、不建议删除、人工�
 """
 
 
+# ── 错误类型与运行统计 ───────────────────────────────────────────────────
 class AdvisorError(RuntimeError):
     pass
 
@@ -51,6 +67,7 @@ class AdvisorStats:
     cache_hits: int = 0
     retries: int = 0
     failures: int = 0
+    # 有意保留：token 计数与耗时不在 CLI/GUI 展示，仅随 summary JSON 落盘供事后核对。
     prompt_tokens: int = 0
     completion_tokens: int = 0
     elapsed_seconds: float = 0.0
@@ -59,6 +76,7 @@ class AdvisorStats:
         return asdict(self)
 
 
+# ── AI 返回解析：JSON 提取 / 严格校验 / 两种协议的文本抽取 ────────────────
 def _extract_json(text: str) -> dict[str, Any]:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -96,7 +114,7 @@ def _validate_advice(data: dict[str, Any], source: str = "ai") -> Advice:
         raise AdvisorError("advice_level 不在允许范围内")
     if not isinstance(data["reason"], str) or not data["reason"].strip():
         raise AdvisorError("reason 必须是非空字符串")
-    if len(data["reason"].strip()) > 120:
+    if len(data["reason"].strip()) > REASON_MAX_LENGTH:
         raise AdvisorError("reason 过长")
     return Advice(
         recommend_delete=data["recommend_delete"],
@@ -107,15 +125,19 @@ def _validate_advice(data: dict[str, Any], source: str = "ai") -> Advice:
     )
 
 
-def _coerce_advice(data: dict[str, Any], source: str) -> Advice:
-    """Backward-compatible alias retained for external imports; now strictly validates."""
-    return _validate_advice(data, source)
-
-
 def _batched(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
     iterator = iter(items)
     while batch := list(islice(iterator, size)):
         yield batch
+
+
+def _text_part_to_str(text: Any) -> str | None:
+    """归一化单个文本片段：纯字符串原样返回，SDK 风格 {"value": ...} 包装则取 value。"""
+    if isinstance(text, str):
+        return text
+    if isinstance(text, dict) and isinstance(text.get("value"), str):
+        return text["value"]
+    return None
 
 
 def _chat_content_to_text(content: Any) -> str:
@@ -127,11 +149,9 @@ def _chat_content_to_text(content: Any) -> str:
             if isinstance(part, str):
                 parts.append(part)
             elif isinstance(part, dict):
-                text = part.get("text") or part.get("content")
-                if isinstance(text, str):
+                text = _text_part_to_str(part.get("text") or part.get("content"))
+                if text is not None:
                     parts.append(text)
-                elif isinstance(text, dict) and isinstance(text.get("value"), str):
-                    parts.append(text["value"])
         if parts:
             return "\n".join(parts)
     raise AdvisorError("Chat Completions 响应中缺少文本内容")
@@ -157,11 +177,9 @@ def _responses_content_to_text(body: dict[str, Any]) -> str:
                     continue
                 if part.get("type") not in {"output_text", "text"}:
                     continue
-                text = part.get("text")
-                if isinstance(text, str):
+                text = _text_part_to_str(part.get("text"))
+                if text is not None:
                     texts.append(text)
-                elif isinstance(text, dict) and isinstance(text.get("value"), str):
-                    texts.append(text["value"])
     if texts:
         return "\n".join(texts)
     raise AdvisorError("Responses API 响应中缺少 output_text")
@@ -188,6 +206,7 @@ def _response_text(body: dict[str, Any], api_style: str) -> str:
     return _chat_content_to_text(content)
 
 
+# ── 混合决策主体 ─────────────────────────────────────────────────────────
 class HybridAdvisor:
     """Local safety rules first; AI is advisory, batched, cached and failure-safe."""
 
@@ -229,13 +248,7 @@ class HybridAdvisor:
             if guard is not None and guard.source == "local-guard":
                 results[index] = guard
             elif not self.ai_available:
-                results[index] = guard or Advice(
-                    recommend_delete=False,
-                    purpose="未知用途",
-                    advice_level="人工确认",
-                    reason="未配置 AI，且本地规则无法安全确认用途。",
-                    source="local-fallback",
-                )
+                results[index] = guard or safe_fallback_advice("未配置 AI，且本地规则无法安全确认用途。")
             else:
                 ai_indices.append(index)
 
@@ -255,15 +268,16 @@ class HybridAdvisor:
         return [
             result
             if result is not None
-            else Advice(False, "未知用途", "人工确认", "内部状态异常，已安全跳过。", "local-fallback")
+            else safe_fallback_advice("内部状态异常，已安全跳过。")
             for result in results
         ]
 
     def advise_ai_only_many(self, metadata_items: Sequence[FileMetadata]) -> list[Advice]:
         """Evaluation-only AI output. It is never used by the cleaner."""
+        # 有意保留：仅 evaluation/run_benchmark.py 的纯 AI 对照方案使用，生产清理路径不走这里。
         if not self.ai_available:
             return [
-                Advice(False, "未知用途", "人工确认", "未配置 AI，无法执行纯 AI 评测。", "ai-unavailable")
+                safe_fallback_advice("未配置 AI，无法执行纯 AI 评测。", source="ai-unavailable")
                 for _ in metadata_items
             ]
         return self._get_ai_advices(metadata_items)
@@ -294,30 +308,24 @@ class HybridAdvisor:
                 reason=f"{guard.reason}（AI 失败：{detail}；已采用本地规则）",
                 source="local-fallback",
             )
-        return Advice(
-            recommend_delete=False,
-            purpose="未知用途",
-            advice_level="人工确认",
-            reason=f"AI 判断失败，已安全跳过：{detail}",
-            source="local-fallback",
-        )
+        return safe_fallback_advice(f"AI 判断失败，已安全跳过：{detail}")
 
     @staticmethod
     def _apply_hybrid_guard(metadata: FileMetadata, guard: Advice | None, ai_advice: Advice) -> Advice:
-        if ai_advice.recommend_delete and not is_auto_delete_eligible(metadata):
+        # AI 建议删除时必须同时通过两道本地闸门（自动清理条件 + 本地规则等级），
+        # 任一不通过就统一降级为"谨慎删除 + 不自动删除"，仅提示理由不同。
+        blocked_reason = ""
+        if ai_advice.recommend_delete:
+            if not is_auto_delete_eligible(metadata):
+                blocked_reason = "AI 倾向清理，但该文件不满足本地自动清理条件。"
+            elif guard is not None and guard.advice_level != "建议删除":
+                blocked_reason = "AI 倾向清理，但本地规则要求人工确认。"
+        if blocked_reason:
             return Advice(
                 recommend_delete=False,
                 purpose=ai_advice.purpose,
                 advice_level="谨慎删除",
-                reason="AI 倾向清理，但该文件不满足本地自动清理条件。",
-                source="hybrid-guarded",
-            )
-        if guard is not None and guard.advice_level != "建议删除" and ai_advice.recommend_delete:
-            return Advice(
-                recommend_delete=False,
-                purpose=ai_advice.purpose,
-                advice_level="谨慎删除",
-                reason="AI 倾向清理，但本地规则要求人工确认。",
+                reason=blocked_reason,
                 source="hybrid-guarded",
             )
         ai_advice.source = "hybrid-cache" if ai_advice.source == "ai-cache" else "hybrid-ai"
@@ -358,7 +366,7 @@ class HybridAdvisor:
         return [
             advice
             if advice is not None
-            else Advice(False, "未知用途", "人工确认", "AI 未返回结果。", "local-fallback")
+            else safe_fallback_advice("AI 未返回结果。")
             for advice in output
         ]
 
@@ -489,3 +497,11 @@ class HybridAdvisor:
             raise
         except AdvisorError as exc:
             raise BatchResponseError(str(exc)) from exc
+
+
+def build_advisor(enable_ai: bool = True, privacy_mode: str | None = None) -> HybridAdvisor:
+    """从 .env 构造顾问；CLI 与 GUI 共用这一个入口，保证配置读取行为一致。"""
+    settings = Settings.from_env()
+    if privacy_mode:
+        settings = replace(settings, ai_privacy_mode=privacy_mode)
+    return HybridAdvisor(settings, enable_ai=enable_ai)

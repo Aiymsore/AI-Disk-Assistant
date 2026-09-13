@@ -1,3 +1,5 @@
+"""元数据采集层：文件大小格式化与 stat 快照采集（底层工具，被 scanner/cleaner/report 使用）。"""
+
 from __future__ import annotations
 
 import time
@@ -24,6 +26,7 @@ def get_file_metadata(file_path: str | Path) -> FileMetadata:
         raise ValueError(f"目标不是普通文件：{path}")
 
     stat = path.stat()
+    # st_mtime_ns / st_atime_ns 等纳秒字段在极老 Python/平台上可能缺失，getattr 回退保证可移植。
     return FileMetadata(
         path=str(path.resolve()),
         name=path.name,

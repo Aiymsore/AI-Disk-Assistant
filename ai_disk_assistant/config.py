@@ -1,3 +1,9 @@
+"""配置层：.env 读写（手写解析，不依赖第三方库）与 Settings 数据类。
+
+被 ai_advisor.py（消费 Settings）与 gui.py（AIConfigDialog 图形编辑 .env）使用；
+DEFAULT_CACHE_PATH / DEFAULT_USER_AGENT 是全项目唯一默认值来源。
+"""
+
 from __future__ import annotations
 
 import os
@@ -6,9 +12,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from . import __version__
 from .privacy import normalize_privacy_mode
 
 
+# 以下两项是全项目唯一默认值来源，GUI 的配置对话框也从这里导入。
+DEFAULT_CACHE_PATH = ".cache/ai_advice.sqlite3"
+DEFAULT_USER_AGENT = f"AI-Disk-Assistant/{__version__}"
+
+
+# ── 接口协议别名归一化 ───────────────────────────────────────────────────
 API_STYLE_ALIASES = {
     "chat": "chat_completions",
     "chat_completion": "chat_completions",
@@ -58,6 +71,7 @@ def default_env_path() -> Path:
     return application_dir() / ".env"
 
 
+# ── .env 读写：手写小解析器，保持注释与未知行不丢失 ──────────────────────
 def read_dotenv(path: Path | None = None) -> dict[str, str]:
     """Read a small ``.env`` file without importing a third-party package."""
     env_path = path or default_env_path()
@@ -145,6 +159,7 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 
 
+# ── Settings：AI 相关配置的唯一载体 ──────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class Settings:
     ai_api_key: str | None
@@ -154,10 +169,10 @@ class Settings:
     ai_batch_size: int = 12
     ai_max_retries: int = 3
     ai_retry_backoff: float = 1.0
-    ai_cache_path: str = ".cache/ai_advice.sqlite3"
+    ai_cache_path: str = DEFAULT_CACHE_PATH
     ai_privacy_mode: str = "balanced"
     ai_api_style: str = "chat_completions"
-    ai_user_agent: str = "AI-Disk-Assistant/1.3"
+    ai_user_agent: str = DEFAULT_USER_AGENT
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -171,8 +186,7 @@ class Settings:
             ai_batch_size=_env_int("AI_BATCH_SIZE", 12, 1),
             ai_max_retries=_env_int("AI_MAX_RETRIES", 3, 0),
             ai_retry_backoff=_env_float("AI_RETRY_BACKOFF", 1.0, 0.0),
-            ai_cache_path=os.getenv("AI_CACHE_PATH", ".cache/ai_advice.sqlite3"),
+            ai_cache_path=os.getenv("AI_CACHE_PATH", DEFAULT_CACHE_PATH),
             ai_privacy_mode=normalize_privacy_mode(os.getenv("AI_PRIVACY_MODE", "balanced")),
-            ai_user_agent=os.getenv("AI_USER_AGENT", "AI-Disk-Assistant/1.3").strip()
-            or "AI-Disk-Assistant/1.3",
+            ai_user_agent=os.getenv("AI_USER_AGENT", DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT,
         )

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ai_disk_assistant.ai_advisor import HybridAdvisor
 from ai_disk_assistant.config import Settings
-from ai_disk_assistant.scanner import ScanPolicy, scan_candidates
+from ai_disk_assistant.scanner import ScanPolicy, scan_with_stats
 
 
 class ScannerTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class ScannerTests(unittest.TestCase):
             os.utime(normal_file, (old_time, old_time))
 
             advisor = HybridAdvisor(Settings(None, "https://example.invalid/v1", "demo", 1), enable_ai=False)
-            candidates = scan_candidates(root, advisor, ScanPolicy(old_days=180, ai_limit=10))
+            candidates = scan_with_stats(root, advisor, ScanPolicy(old_days=180, ai_limit=10)).candidates
             paths = {Path(item.metadata.path).name for item in candidates}
             self.assertIn("app.log", paths)
             self.assertNotIn("notes.txt", paths)

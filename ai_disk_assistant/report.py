@@ -1,9 +1,15 @@
+"""报告层：CSV / JSON / 统计摘要 / HTML 可视化四种产物的生成。
+
+cli.py 与 gui.py 统一经 write_all_reports 走同一条流水线，不各自拼装。
+"""
+
 from __future__ import annotations
 
 import csv
 import html
 import json
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -12,6 +18,7 @@ from .metadata import format_size
 from .models import Candidate, ScanStats
 
 
+# ── CSV 字段表：Candidate.to_row() 的输出顺序与此一一对应 ────────────────
 FIELDNAMES = [
     "path",
     "name",
@@ -59,6 +66,7 @@ def write_json(candidates: Iterable[Candidate], output: str | Path) -> Path:
     return path.resolve()
 
 
+# ── 统计摘要：所有聚合数字只在这里算一次 ─────────────────────────────────
 def build_summary(
     candidates: Iterable[Candidate],
     scan_stats: ScanStats | Mapping[str, Any] | None = None,
@@ -122,6 +130,40 @@ def write_summary_json(summary: Mapping[str, Any], output: str | Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(summary), ensure_ascii=False, indent=2), encoding="utf-8")
     return path.resolve()
+
+
+@dataclass(slots=True)
+class ReportPaths:
+    """一次扫描产出的各报告文件路径；detail_json 仅在显式要求时生成。"""
+
+    csv: Path
+    summary: Path
+    html: Path
+    detail_json: Path | None = None
+
+
+def write_all_reports(
+    candidates: Iterable[Candidate],
+    scan_stats: ScanStats | Mapping[str, Any] | None,
+    advisor_stats: Mapping[str, Any] | None,
+    *,
+    csv_path: str | Path | None = None,
+    detail_json_path: str | Path | None = None,
+    summary_json_path: str | Path | None = None,
+    html_path: str | Path | None = None,
+) -> ReportPaths:
+    """CLI 与 GUI 共用的报告流水线：CSV + 统计摘要 JSON + HTML 必写，明细 JSON 可选。
+
+    未显式给路径的报告落到 reports/ 目录下的默认时间戳文件名。
+    """
+    items = list(candidates)
+    summary = build_summary(items, scan_stats, advisor_stats)
+    return ReportPaths(
+        csv=write_csv(items, csv_path or default_report_path("csv")),
+        detail_json=write_json(items, detail_json_path) if detail_json_path else None,
+        summary=write_summary_json(summary, summary_json_path or default_report_path("summary.json")),
+        html=write_html_report(summary, html_path or default_report_path("html")),
+    )
 
 
 def _distribution_rows(distribution: Mapping[str, int]) -> str:

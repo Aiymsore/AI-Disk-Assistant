@@ -1,3 +1,9 @@
+"""清理层：筛选"建议删除"项、TOCTOU 竞态校验、移入系统回收站。
+
+被 cli.py（--trash-auto）与 gui.py（回收站按钮）调用；是唯一真正动文件的模块，
+每一步都先过 safety.can_move_to_trash 与状态复核。
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -36,6 +42,7 @@ def verify_file_unchanged(metadata: FileMetadata) -> tuple[bool, str]:
         return False, "文件修改时间在扫描后发生变化"
 
     current_device = int(getattr(stat, "st_dev", 0))
+    # st_dev / st_ino 用于识别"路径指向换了文件"；FAT 等文件系统可能恒为 0，为 0 时跳过该检查。
     current_file_id = int(getattr(stat, "st_ino", 0))
     if metadata.device_id and current_device and current_device != metadata.device_id:
         return False, "文件所在设备在扫描后发生变化"

@@ -4,6 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-disk-assistant"
+# 与 ai_disk_assistant/__init__.py 的 __version__ 保持一致
 version = "1.3.0"
 description = "A safety-first Windows disk analysis assistant with GUI trash actions and AI configuration."
 readme = "README.md"

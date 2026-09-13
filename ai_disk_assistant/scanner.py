@@ -1,3 +1,8 @@
+"""扫描层：遍历目录 → 多信号打分 → top-N 保留 → 调用 HybridAdvisor 批量判断。
+
+被 cli.py / gui.py 的扫描入口调用；只产出候选与建议，不做任何删除动作。
+"""
+
 from __future__ import annotations
 
 import heapq
@@ -11,15 +16,18 @@ from typing import Callable, Iterable
 
 from .ai_advisor import HybridAdvisor
 from .metadata import get_file_metadata
-from .models import Advice, Candidate, FileMetadata, ScanResult, ScanStats
-from .safety import PROTECTED_DIR_NAMES, SAFE_CONTEXT_NAMES, is_protected_path
+from .models import Candidate, FileMetadata, ScanResult, ScanStats, safe_fallback_advice
+from .safety import (
+    INSTALLER_SUFFIXES,
+    PROTECTED_DIR_NAMES,
+    SAFE_CONTEXT_NAMES,
+    SIGNAL_ARCHIVE_SUFFIXES,
+    SIGNAL_JUNK_SUFFIXES,
+    is_protected_path,
+)
 
 
-JUNK_SUFFIXES = {".tmp", ".temp", ".log", ".bak", ".old", ".dmp"}
-INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".apk"}
-ARCHIVE_SUFFIXES = {".zip", ".rar", ".7z", ".tar", ".gz", ".iso"}
-
-
+# ── 扫描策略：CLI/GUI 的参数默认值统一以这里的字段为唯一来源 ──────────────
 @dataclass(frozen=True, slots=True)
 class ScanPolicy:
     old_days: int = 180
@@ -30,6 +38,7 @@ class ScanPolicy:
     max_scan_files: int = 0  # 0 means full traversal.
 
 
+# ── 目录遍历：跳过受保护目录与符号链接 ───────────────────────────────────
 def _iter_files(root: Path) -> Iterable[Path]:
     for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
         dirnames[:] = [
@@ -44,6 +53,7 @@ def _iter_files(root: Path) -> Iterable[Path]:
                 yield path
 
 
+# ── 候选打分：多信号累加，无任何信号则不成为候选 ─────────────────────────
 def _candidate_signals(path: Path, root: Path, policy: ScanPolicy) -> tuple[str, float, int] | None:
     try:
         stat = path.stat()
@@ -67,7 +77,7 @@ def _candidate_signals(path: Path, root: Path, policy: ScanPolicy) -> tuple[str,
 
     reasons: list[str] = []
     score = 0.0
-    if suffix in JUNK_SUFFIXES:
+    if suffix in SIGNAL_JUNK_SUFFIXES:
         reasons.append("临时/日志类后缀")
         score += 35
     if in_safe_context:
@@ -76,7 +86,7 @@ def _candidate_signals(path: Path, root: Path, policy: ScanPolicy) -> tuple[str,
     if is_old:
         reasons.append(f"超过 {policy.old_days} 天未修改（访问时间仅供参考）")
         score += min(age_days / max(policy.old_days, 1), 3.0) * 8
-    if is_small and (suffix in JUNK_SUFFIXES or in_safe_context):
+    if is_small and (suffix in SIGNAL_JUNK_SUFFIXES or in_safe_context):
         reasons.append("小型缓存类文件")
         score += 3
     if is_big and is_old:
@@ -85,13 +95,13 @@ def _candidate_signals(path: Path, root: Path, policy: ScanPolicy) -> tuple[str,
     if suffix in INSTALLER_SUFFIXES and is_old:
         reasons.append("长期未修改的安装包")
         score += 12
-    if suffix in ARCHIVE_SUFFIXES and is_old:
+    if suffix in SIGNAL_ARCHIVE_SUFFIXES and is_old:
         reasons.append("长期未修改的压缩包或镜像")
         score += 10
 
     has_context_signal = (
         in_safe_context
-        or suffix in JUNK_SUFFIXES | INSTALLER_SUFFIXES | ARCHIVE_SUFFIXES
+        or suffix in SIGNAL_JUNK_SUFFIXES | INSTALLER_SUFFIXES | SIGNAL_ARCHIVE_SUFFIXES
         or is_big
     )
     if not reasons or not has_context_signal:
@@ -102,6 +112,7 @@ def _candidate_signals(path: Path, root: Path, policy: ScanPolicy) -> tuple[str,
     return "；".join(dict.fromkeys(reasons)), score, stat.st_size
 
 
+# ── top-N 保留：小顶堆维护当前最高分的 max_candidates 个候选 ─────────────
 def _retain_top_candidate(
     heap: list[tuple[float, int, int, str, str]],
     path: Path,
@@ -118,6 +129,7 @@ def _retain_top_candidate(
         heapq.heapreplace(heap, item)
 
 
+# ── 主流程：遍历 → 打分 → 采集元数据 → AI 判断（可限额）→ 组装结果 ────────
 def scan_with_stats(
     root: str | Path,
     advisor: HybridAdvisor,
@@ -181,11 +193,8 @@ def scan_with_stats(
         if index < ai_count:
             advice = advices[index]
         else:
-            advice = Advice(
-                recommend_delete=False,
-                purpose="未知用途",
-                advice_level="人工确认",
-                reason=f"超过本次 AI 判断上限 {scan_policy.ai_limit}，需人工确认。",
+            advice = safe_fallback_advice(
+                f"超过本次 AI 判断上限 {scan_policy.ai_limit}，需人工确认。",
                 source="not-evaluated",
             )
         results.append(
@@ -200,13 +209,3 @@ def scan_with_stats(
     stats.retained_candidates = len(results)
     stats.elapsed_seconds = round(time.perf_counter() - started, 4)
     return ScanResult(candidates=results, stats=stats)
-
-
-def scan_candidates(
-    root: str | Path,
-    advisor: HybridAdvisor,
-    policy: ScanPolicy | None = None,
-    progress: Callable[[int], None] | None = None,
-) -> list[Candidate]:
-    """Backward-compatible wrapper returning only candidates."""
-    return scan_with_stats(root, advisor, policy, progress).candidates
