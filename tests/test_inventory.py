@@ -39,7 +39,8 @@ def seed_snapshot(inventory: Inventory, root: Path, files: list[tuple[str, int]]
 class InventoryQueryTests(unittest.TestCase):
     def setUp(self) -> None:
         self._stack = ExitStack()
-        self.temp_dir = Path(self._stack.enter_context(tempfile.TemporaryDirectory()))
+        # resolve 统一长短路径：CI runner 的 TEMP 是 8.3 短名（RUNNER~1），查询与入库必须同形
+        self.temp_dir = Path(self._stack.enter_context(tempfile.TemporaryDirectory())).resolve()
         inv_dir = Path(self._stack.enter_context(tempfile.TemporaryDirectory()))
         self.inventory = Inventory(inv_dir / "inv.sqlite3")
         # 布局：big/sub7(8KB log)、big/sub6(7KB log)、big 散文件 loose_old.tmp、other/note.txt + 同体积组

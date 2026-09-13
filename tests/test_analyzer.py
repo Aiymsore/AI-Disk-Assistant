@@ -23,7 +23,8 @@ class AnalyzerSmokeTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._stack = ExitStack()
-        self.temp_dir = Path(self._stack.enter_context(tempfile.TemporaryDirectory()))
+        # resolve 统一长短路径：CI runner 的 TEMP 是 8.3 短名（RUNNER~1），查询与入库必须同形
+        self.temp_dir = Path(self._stack.enter_context(tempfile.TemporaryDirectory())).resolve()
         inv_dir = Path(self._stack.enter_context(tempfile.TemporaryDirectory()))
         self.inventory_path = inv_dir / "inv.sqlite3"
         # 布局：big(8 个子目录 + 1 个散文件) 触发下钻；other 小区域直接评分；
