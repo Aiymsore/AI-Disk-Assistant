@@ -34,3 +34,6 @@ demo/sample_disk/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ZCode session artifacts
+.zcode/
