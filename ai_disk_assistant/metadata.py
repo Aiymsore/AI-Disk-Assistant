@@ -1,4 +1,4 @@
-"""元数据采集层：文件大小格式化与 stat 快照采集（底层工具，被 scanner/cleaner/report 使用）。"""
+"""元数据采集层：文件大小格式化与 stat 快照采集（底层工具，被 scanner/report 使用）。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,30 @@ def format_size(size: int) -> str:
             return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
     return f"{size} B"
+
+
+def format_mtime(ns: int) -> str:
+    """把纳秒时间戳格式化为可显示文本；快照里的垃圾时间（极端值）统一显示为 —。
+
+    Windows 的 time.localtime 对负时间戳（1970 前）直接抛 OSError，必须防御，
+    否则一条脏数据就能让整个目录列表渲染中断。
+    """
+    if not ns:
+        return "—"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ns / 1_000_000_000))
+    except (OSError, OverflowError, ValueError):
+        return "—"
+
+
+def format_pct(size: int, total: int) -> str:
+    """占父级（或全卷）的百分比，保留一位小数。
+
+    整数地板除会把所有 <1% 的项都显示成 0%，小目录在巨型父目录里看起来像没有占比。
+    """
+    if total <= 0:
+        return "0.0%"
+    return f"{size * 100 / total:.1f}%"
 
 
 def get_file_metadata(file_path: str | Path) -> FileMetadata:

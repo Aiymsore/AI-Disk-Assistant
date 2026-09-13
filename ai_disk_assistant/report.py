@@ -39,6 +39,7 @@ FIELDNAMES = [
     "advice_level",
     "advice_reason",
     "advice_source",
+    "advice_evidence",
 ]
 
 
@@ -200,7 +201,7 @@ def write_html_report(summary: Mapping[str, Any], output: str | Path) -> Path:
 <head>
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>AI Disk Assistant 扫描摘要</title>
+<title>P4Disk4P 扫描摘要</title>
 <style>
 body{{font-family:Segoe UI,Microsoft YaHei,sans-serif;margin:0;background:#f5f7fb;color:#1f2937}}
 main{{max-width:1120px;margin:32px auto;padding:0 20px}}
@@ -216,7 +217,7 @@ code{{background:#eef2ff;padding:2px 6px;border-radius:5px}}
 </style>
 </head>
 <body><main>
-<h1>AI Disk Assistant 扫描摘要</h1>
+<h1>P4Disk4P 扫描摘要</h1>
 <p class='muted'>生成时间：{html.escape(str(summary.get('generated_at', '')))}</p>
 <section class='cards'>
 <div class='card'><div class='muted'>候选文件</div><div class='value'>{summary.get('candidate_count', 0)}</div></div>
@@ -231,6 +232,7 @@ code{{background:#eef2ff;padding:2px 6px;border-radius:5px}}
 <div class='panel'><h2>运行信息</h2>
 <p>检查文件：<strong>{scan.get('visited_files', 0)}</strong></p>
 <p>命中候选：<strong>{scan.get('matched_candidates', 0)}</strong></p>
+<p>判定单元：<strong>{scan.get('unit_count', 0)}</strong>（AI 实判 {scan.get('units_judged', 0)} 个）</p>
 <p>扫描耗时：<strong>{scan.get('elapsed_seconds', 0)} 秒</strong></p>
 <p>AI 协议：<strong>{html.escape(str(ai.get('api_style', '未启用')))}</strong></p>
 <p>AI 请求：<strong>{ai.get('api_calls', 0)}</strong>，缓存命中：<strong>{ai.get('cache_hits', 0)}</strong></p>

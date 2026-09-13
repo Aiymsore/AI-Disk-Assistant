@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,11 @@ ADVICE_LEVELS = {"建议删除", "谨慎删除", "不建议删除", "人工确�
 # - ai_advisor._validate_advice：AI 返回超限直接报错（严格校验，防止提示词被无视）
 # - Advice.__post_init__：本地构造超限静默截断（兜底容错，保证任何来源都能落地）
 REASON_MAX_LENGTH = 120
+
+# AI 判断必须附带"证据"：从输入中原样引用的事实（"字段名=值"），由证据校验层回数据库核对。
+# 上限与 reason 同策略：AI 返回超限直接报错（严格校验），本地构造超限静默截断（兜底容错）。
+EVIDENCE_MAX_ITEMS = 6
+EVIDENCE_MAX_LENGTH = 80
 
 
 @dataclass(slots=True)
@@ -66,12 +71,34 @@ class FileMetadata:
 
 
 @dataclass(slots=True)
+class Unit:
+    """判定单元：同一目录下同后缀、大小同档的候选文件聚合。
+
+    unit_id 是模式指纹（目录+后缀+大小档），不含数量/体积等易变聚合值，
+    也不含修改时间（mtime 不可靠且会造成缓存无谓失效）——
+    这样同一类文件跨扫描复用同一条 AI 判定，保证结果一致并压低调用量。
+    members 仅驻内存，用于把单元判定展开回文件；不参与序列化与缓存键。
+    """
+
+    unit_id: str
+    parent_folder: str
+    suffix: str
+    size_bucket: str
+    file_count: int = 0
+    total_size: int = 0
+    best_score: float = 0.0
+    members: list[FileMetadata] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class Advice:
     recommend_delete: bool
     purpose: str
     advice_level: str
     reason: str
     source: str = "local-rule"
+    # 判断所依据的事实清单（"字段名=值"），本地规则可留空；AI 结果由证据校验层核对。
+    evidence: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.purpose not in PURPOSES:
@@ -81,6 +108,9 @@ class Advice:
         self.reason = self.reason.strip()[:REASON_MAX_LENGTH] or "缺少可靠判断依据，建议人工确认。"
         if self.advice_level != "建议删除":
             self.recommend_delete = False
+        self.evidence = [
+            text.strip()[:EVIDENCE_MAX_LENGTH] for text in (self.evidence or []) if str(text).strip()
+        ][:EVIDENCE_MAX_ITEMS]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -118,6 +148,7 @@ class Candidate:
                 "advice_level": self.advice.advice_level,
                 "advice_reason": self.advice.reason,
                 "advice_source": self.advice.source,
+                "advice_evidence": "；".join(self.advice.evidence),
             }
         )
         return row
@@ -135,6 +166,9 @@ class ScanStats:
     retained_candidates: int = 0
     skipped_errors: int = 0
     elapsed_seconds: float = 0.0
+    # 判定单元统计：unit_count 为归并后的单元总数，units_judged 为其中进入 AI 判定的数量。
+    unit_count: int = 0
+    units_judged: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

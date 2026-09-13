@@ -26,7 +26,7 @@ class ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output = write_html_report(summary, Path(temp_dir) / "report.html")
             text = output.read_text(encoding="utf-8")
-            self.assertIn("AI Disk Assistant", text)
+            self.assertIn("P4Disk4P", text)
             self.assertIn("1.00 KB", text)
 
 

@@ -18,7 +18,8 @@ from .privacy import normalize_privacy_mode
 
 # 以下两项是全项目唯一默认值来源，GUI 的配置对话框也从这里导入。
 DEFAULT_CACHE_PATH = ".cache/ai_advice.sqlite3"
-DEFAULT_USER_AGENT = f"AI-Disk-Assistant/{__version__}"
+DEFAULT_INVENTORY_PATH = ".cache/inventory.sqlite3"
+DEFAULT_USER_AGENT = f"P4Disk4P/{__version__}"
 
 
 # ── 接口协议别名归一化 ───────────────────────────────────────────────────

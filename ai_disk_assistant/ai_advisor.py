@@ -20,14 +20,21 @@ from .cache import AdviceCache
 from .config import Settings
 from .models import (
     ADVICE_LEVELS,
+    EVIDENCE_MAX_ITEMS,
+    EVIDENCE_MAX_LENGTH,
     PURPOSES,
     REASON_MAX_LENGTH,
     Advice,
     FileMetadata,
+    Unit,
     safe_fallback_advice,
 )
-from .privacy import metadata_for_ai
-from .safety import is_auto_delete_eligible, local_safety_guard
+from .privacy import metadata_for_ai, unit_payload_for_ai
+from .safety import (
+    RULES_VERSION,
+    decide_unit_advice,
+    local_safety_guard,
+)
 
 
 # ── 系统提示词：purpose / advice_level 的枚举清单与 models.py 的常量保持一致 ──
@@ -44,6 +51,66 @@ SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的文件安全建议模�
 
 输出格式：
 {"results":[{"id":0,"recommend_delete":false,"purpose":"未知用途","advice_level":"人工确认","reason":"依据不足"}]}
+
+purpose 只能是：缓存文件、临时文件、日志文件、安装包或下载残留、程序配置文件、系统文件、用户文档、媒体文件、代码或项目文件、存档或备份文件、未知用途。
+advice_level 只能是：建议删除、谨慎删除、不建议删除、人工确认。
+"""
+
+# 区域选择的 reason 长度上限（suggest_areas 解析时截断）。
+_AREA_REASON_MAX_LENGTH = 60
+
+# 重复组判读的合法结论集合。
+DUPLICATE_VERDICTS = {"likely", "possible", "unlikely"}
+
+DUPLICATE_SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的重复文件判读模块。
+输入是若干"同体积文件组"：体积完全相同的文件聚合（同体积可能巧合，未必同内容）。
+你的任务：根据路径模式与文件名，判读每组更可能是哪种情况，仅作提示：
+- likely：大概率是真重复（下载残留、副本、旧版本散落多处）
+- possible：有重复迹象但证据不足
+- unlikely：更可能是巧合同体积或各有所用（如系统组件、数据分片）
+不得输出删除建议；真正的去重必须由用户核对内容后自行决定。
+规则：
+1. 只输出 JSON 对象，不输出 Markdown。
+2. 对每个输入 id 返回一条结果，不遗漏、不新增。
+3. verdict 只能是 likely / possible / unlikely。
+4. reason 不超过 40 个中文字符。
+输出格式：
+{"reviews":[{"id":0,"verdict":"likely","reason":"同名安装包散落多处"}]}
+"""
+
+ANALYZE_SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的目录区域判读模块。
+输入是一次磁盘扫描中体积最大的目录聚合列表（路径模式、总大小、文件数、主要后缀）。
+你的任务：挑出值得深入分析的可疑区域——通常是缓存、临时文件、日志、崩溃转储、
+下载残留、安装包或过期备份集中的目录。
+不要挑选：系统或程序目录、明显的用户文档/项目/媒体库、整个盘根或单一文件。
+规则：
+1. 只输出 JSON 对象，不输出 Markdown。
+2. areas 数组最少 1 个、最多 8 个，按可疑程度降序。
+3. reason 不超过 40 个中文字符，说明为什么可疑。
+4. id 必须原样引用输入中的 id，不得新增或改写。
+输出格式：
+{"areas":[{"id":0,"reason":"日志缓存密集，体积大"}]}
+"""
+
+# 判定单元提示词版本：进入单元判定缓存键。任何提示词变更都必须递增，旧缓存自动失效。
+PROMPT_VERSION = "unit-prompt-3"
+
+UNIT_SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的文件组安全建议模块。
+输入是"判定单元"：同一目录下、同后缀、大小同档的一组文件的聚合统计。
+你只能根据输入给出的统计字段判断，不能假设读取过文件内容。
+
+安全原则：
+1. 系统文件、程序核心文件、用户文档、媒体文件、代码和备份不得建议删除。
+2. 除此之外可以适度积极：缓存、临时文件、日志、崩溃转储、下载残留、安装包、
+   过期压缩包，以及看起来已被遗弃的文件，在证据支持时可以直接建议删除。
+3. 证据不足以支持"建议删除"时用"谨慎删除"，再弱则"人工确认"，不得冒险。
+4. evidence 必须从输入字段中原样引用至少 1 条，格式为"字段名=值"，不得编造输入中没有的事实。
+5. reason 不超过 60 个中文字符。
+6. 对每个输入 id 返回一条结果，不遗漏、不新增。
+7. 只输出 JSON 对象，不输出 Markdown。
+
+输出格式：
+{"results":[{"id":0,"recommend_delete":false,"purpose":"未知用途","advice_level":"人工确认","reason":"依据不足","evidence":["suffix=.tmp"]}]}
 
 purpose 只能是：缓存文件、临时文件、日志文件、安装包或下载残留、程序配置文件、系统文件、用户文档、媒体文件、代码或项目文件、存档或备份文件、未知用途。
 advice_level 只能是：建议删除、谨慎删除、不建议删除、人工确认。
@@ -116,13 +183,40 @@ def _validate_advice(data: dict[str, Any], source: str = "ai") -> Advice:
         raise AdvisorError("reason 必须是非空字符串")
     if len(data["reason"].strip()) > REASON_MAX_LENGTH:
         raise AdvisorError("reason 过长")
+    # evidence 可选（兼容旧的逐文件提示词），但出现时必须是短字符串数组。
+    evidence = data.get("evidence", [])
+    if not isinstance(evidence, list) or not all(isinstance(item, str) for item in evidence):
+        raise AdvisorError("evidence 必须是字符串数组")
+    if len(evidence) > EVIDENCE_MAX_ITEMS:
+        raise AdvisorError("evidence 条数超限")
+    if any(not item.strip() or len(item) > EVIDENCE_MAX_LENGTH for item in evidence):
+        raise AdvisorError("evidence 存在空项或超长项")
     return Advice(
         recommend_delete=data["recommend_delete"],
         purpose=data["purpose"],
         advice_level=data["advice_level"],
         reason=data["reason"],
         source=source,
+        evidence=evidence,
     )
+
+
+def _validate_unit_evidence(payload: dict[str, Any], evidence: list[str]) -> bool:
+    """证据校验：AI 引用的每条事实必须能在发送给它的载荷中原样找到。
+
+    这是"严格基于数据库判断"的落点——载荷字段全部来自扫描事实，
+    编造的字段名或对不上的取值都会让整条判定降级为人工确认。
+    """
+    if not evidence:
+        return False
+    for item in evidence:
+        key, separator, value = item.partition("=")
+        if not separator:
+            return False
+        expected = payload.get(key.strip())
+        if expected is None or str(expected) != value.strip():
+            return False
+    return True
 
 
 def _batched(items: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
@@ -272,9 +366,66 @@ class HybridAdvisor:
             for result in results
         ]
 
+    def advise_units(self, units: Sequence[Unit]) -> list[Advice]:
+        """判定单元管道：本地硬守卫就地裁决 → 其余全部交 AI（缓存 → 证据校验 → 决策表）。
+
+        有意不设"明显垃圾零 AI 直判"的短路：AI 是主判断者，对典型垃圾做独立确认，
+        对守卫放行的未知类型有完整判断权（含"建议删除"）。缓存保证同单元只问一次。
+        返回顺序与输入一致；最终建议永远出自 decide_unit_advice，AI 无权越过守卫上限。
+        """
+        if not units:
+            return []
+
+        results: list[Advice | None] = [None] * len(units)
+        ai_indices: list[int] = []
+        guards: dict[int, Advice | None] = {}
+
+        for index, unit in enumerate(units):
+            representative = unit.members[0] if unit.members else None
+            guard = local_safety_guard(representative) if representative is not None else None
+            guards[index] = guard
+            if guard is not None and guard.source == "local-guard":
+                # 本地硬规则（受保护目录/可执行/用户内容类）的结论 AI 无权推翻，就地裁决。
+                results[index] = guard
+            elif not self.ai_available:
+                results[index] = (
+                    guard
+                    if guard is not None
+                    else safe_fallback_advice("未配置 AI，且本地规则无法安全确认用途。", source="unit-fallback")
+                )
+            else:
+                ai_indices.append(index)
+
+        if ai_indices:
+            ai_units = [units[index] for index in ai_indices]
+            try:
+                raw_advices = self._get_unit_advices(ai_units)
+            except (AdvisorError, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                self.stats.failures += len(ai_indices)
+                for index in ai_indices:
+                    guard = guards[index]
+                    results[index] = self._fallback_advice(guard, exc)
+            else:
+                for index, raw_advice in zip(ai_indices, raw_advices, strict=True):
+                    unit = units[index]
+                    payload = unit_payload_for_ai(unit, self.settings.ai_privacy_mode)
+                    evidence_ok = _validate_unit_evidence(payload, raw_advice.evidence)
+                    results[index] = decide_unit_advice(
+                        guards[index],
+                        raw_advice,
+                        evidence_ok=evidence_ok,
+                    )
+
+        return [
+            result
+            if result is not None
+            else safe_fallback_advice("内部状态异常，已安全跳过。", source="unit-fallback")
+            for result in results
+        ]
+
     def advise_ai_only_many(self, metadata_items: Sequence[FileMetadata]) -> list[Advice]:
-        """Evaluation-only AI output. It is never used by the cleaner."""
-        # 有意保留：仅 evaluation/run_benchmark.py 的纯 AI 对照方案使用，生产清理路径不走这里。
+        """Evaluation-only AI output. It is never used by the production scan pipeline."""
+        # 有意保留：仅 evaluation/run_benchmark.py 的纯 AI 对照方案使用，生产扫描路径不走这里。
         if not self.ai_available:
             return [
                 safe_fallback_advice("未配置 AI，无法执行纯 AI 评测。", source="ai-unavailable")
@@ -298,6 +449,51 @@ class HybridAdvisor:
         }
         return self._request_ai_batch([payload])[0]
 
+    def _get_unit_advices(self, units: Sequence[Unit]) -> list[Advice]:
+        """单元级 AI 调用：缓存键 = 供应商 + 隐私档 + 单元指纹 + 提示词/规则版本。
+
+        指纹只含稳定模式（不含数量/体积），同类文件跨扫描直接命中缓存——
+        "同样的盘状态必得同样的建议"由缓存数学保证，不依赖模型逐字稳定。
+        """
+        output: list[Advice | None] = [None] * len(units)
+        pending: list[tuple[int, Unit, dict[str, Any], str]] = []
+
+        provider_identity = (
+            f"{self.settings.ai_base_url}|{self.settings.ai_api_style}|{self.settings.ai_model}"
+        )
+        for index, unit in enumerate(units):
+            payload = unit_payload_for_ai(unit, self.settings.ai_privacy_mode)
+            key_material = {
+                "unit_fingerprint": unit.unit_id,
+                "prompt_version": PROMPT_VERSION,
+                "rules_version": RULES_VERSION,
+            }
+            cache_key = AdviceCache.make_key(provider_identity, self.settings.ai_privacy_mode, key_material)
+            cached = self.cache.get(cache_key) if self.cache is not None else None
+            if cached is not None:
+                cached.source = "unit-cache"
+                output[index] = cached
+                self.stats.cache_hits += 1
+            else:
+                pending.append((index, unit, payload, cache_key))
+
+        for batch in _batched(pending, self.settings.ai_batch_size):
+            batch_payloads = [entry[2] for entry in batch]
+            advices = self._request_ai_batch_resilient(
+                batch_payloads, system_prompt=UNIT_SYSTEM_PROMPT, user_heading="判定单元"
+            )
+            for (index, _unit, payload, cache_key), advice in zip(batch, advices, strict=True):
+                output[index] = advice
+                if self.cache is not None:
+                    self.cache.set(cache_key, payload, advice)
+
+        return [
+            advice
+            if advice is not None
+            else safe_fallback_advice("AI 未返回结果。", source="unit-fallback")
+            for advice in output
+        ]
+
     def _fallback_advice(self, guard: Advice | None, exc: Exception) -> Advice:
         detail = " ".join(str(exc).split())[:70]
         if guard is not None:
@@ -312,14 +508,10 @@ class HybridAdvisor:
 
     @staticmethod
     def _apply_hybrid_guard(metadata: FileMetadata, guard: Advice | None, ai_advice: Advice) -> Advice:
-        # AI 建议删除时必须同时通过两道本地闸门（自动清理条件 + 本地规则等级），
-        # 任一不通过就统一降级为"谨慎删除 + 不自动删除"，仅提示理由不同。
+        # AI 建议删除时若本地守卫持保留意见（人工确认/不建议），统一降级为"谨慎删除"。
         blocked_reason = ""
-        if ai_advice.recommend_delete:
-            if not is_auto_delete_eligible(metadata):
-                blocked_reason = "AI 倾向清理，但该文件不满足本地自动清理条件。"
-            elif guard is not None and guard.advice_level != "建议删除":
-                blocked_reason = "AI 倾向清理，但本地规则要求人工确认。"
+        if ai_advice.recommend_delete and guard is not None and guard.advice_level != "建议删除":
+            blocked_reason = "AI 倾向清理，但本地规则要求人工确认。"
         if blocked_reason:
             return Advice(
                 recommend_delete=False,
@@ -370,28 +562,44 @@ class HybridAdvisor:
             for advice in output
         ]
 
-    def _request_ai_batch_resilient(self, payloads: Sequence[dict[str, Any]]) -> list[Advice]:
+    def _request_ai_batch_resilient(
+        self,
+        payloads: Sequence[dict[str, Any]],
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+        user_heading: str = "文件元数据",
+    ) -> list[Advice]:
         """Split malformed/unsupported batches so one bad item does not discard all results."""
         try:
-            return self._request_ai_batch(payloads)
+            return self._request_ai_batch(payloads, system_prompt=system_prompt, user_heading=user_heading)
         except BatchResponseError:
             if len(payloads) <= 1:
                 raise
             midpoint = len(payloads) // 2
-            left = self._request_ai_batch_resilient(payloads[:midpoint])
-            right = self._request_ai_batch_resilient(payloads[midpoint:])
+            left = self._request_ai_batch_resilient(
+                payloads[:midpoint], system_prompt=system_prompt, user_heading=user_heading
+            )
+            right = self._request_ai_batch_resilient(
+                payloads[midpoint:], system_prompt=system_prompt, user_heading=user_heading
+            )
             return left + right
 
-    def _build_request(self, payloads: Sequence[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    def _build_request(
+        self,
+        payloads: Sequence[dict[str, Any]],
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+        user_heading: str = "文件元数据",
+    ) -> tuple[str, dict[str, Any]]:
         items = [{"id": index, **payload} for index, payload in enumerate(payloads)]
-        user_text = "请逐项判断以下文件元数据：\n" + json.dumps(items, ensure_ascii=False)
+        user_text = f"请逐项判断以下{user_heading}：\n" + json.dumps(items, ensure_ascii=False)
 
         if self.settings.ai_api_style == "responses":
             return (
                 f"{self.settings.ai_base_url}/responses",
                 {
                     "model": self.settings.ai_model,
-                    "instructions": SYSTEM_PROMPT,
+                    "instructions": system_prompt,
                     "input": user_text,
                     "store": False,
                 },
@@ -402,17 +610,18 @@ class HybridAdvisor:
             {
                 "model": self.settings.ai_model,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text},
                 ],
             },
         )
 
-    def _request_ai_batch(self, payloads: Sequence[dict[str, Any]]) -> list[Advice]:
-        endpoint, payload = self._build_request(payloads)
+    def _post_with_retries(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """HTTP POST + 重试 + 调用统计的公共核心；chat 判定与区域选择共用。"""
         request_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last_error: Exception | None = None
         started = time.perf_counter()
+        body: dict[str, Any] | None = None
 
         for attempt in range(self.settings.ai_max_retries + 1):
             request = urllib.request.Request(
@@ -454,8 +663,9 @@ class HybridAdvisor:
             raise AdvisorError(f"AI 请求失败：{last_error}")
 
         self.stats.elapsed_seconds += time.perf_counter() - started
-        self.stats.api_items += len(payloads)
-        usage = body.get("usage", {}) if isinstance(body, dict) else {}
+        if not isinstance(body, dict):
+            raise AdvisorError("AI 接口响应不是 JSON 对象")
+        usage = body.get("usage", {})
         if isinstance(usage, dict):
             self.stats.prompt_tokens += int(
                 usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
@@ -463,6 +673,132 @@ class HybridAdvisor:
             self.stats.completion_tokens += int(
                 usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
             )
+        return body
+
+    def suggest_areas(self, area_payloads: Sequence[dict[str, Any]]) -> list[tuple[int, str]] | None:
+        """阶段一：让 AI 从目录聚合列表里挑出可疑区域，返回 (id, 理由) 列表。
+
+        未配置 AI、请求失败或结果不可解析时返回 None，调用方回退体积启发式；
+        区域选择是建议性输入，任何失败都不应中断分析流程。
+        """
+        if not self.ai_available or not area_payloads:
+            return None
+        items = [{"id": index, **payload} for index, payload in enumerate(area_payloads)]
+        user_text = "请从以下目录聚合中挑出可疑区域：\n" + json.dumps(items, ensure_ascii=False)
+        if self.settings.ai_api_style == "responses":
+            endpoint = f"{self.settings.ai_base_url}/responses"
+            request_payload: dict[str, Any] = {
+                "model": self.settings.ai_model,
+                "instructions": ANALYZE_SYSTEM_PROMPT,
+                "input": user_text,
+                "store": False,
+            }
+        else:
+            endpoint = f"{self.settings.ai_base_url}/chat/completions"
+            request_payload = {
+                "model": self.settings.ai_model,
+                "messages": [
+                    {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+            }
+        try:
+            body = self._post_with_retries(endpoint, request_payload)
+            content = _response_text(body, self.settings.ai_api_style)
+            data = _extract_json(content)
+        except (AdvisorError, urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return None
+
+        raw = data.get("areas")
+        if not isinstance(raw, list):
+            return None
+        selections: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            area_id = entry.get("id")
+            reason = entry.get("reason")
+            if not isinstance(area_id, int) or isinstance(area_id, bool):
+                continue
+            if not 0 <= area_id < len(area_payloads) or area_id in seen:
+                continue
+            if not isinstance(reason, str) or not reason.strip():
+                continue
+            seen.add(area_id)
+            selections.append((area_id, reason.strip()[:_AREA_REASON_MAX_LENGTH]))
+            if len(selections) >= 8:
+                break
+        return selections or None
+
+    def review_duplicates(
+        self, group_payloads: Sequence[dict[str, Any]]
+    ) -> list[tuple[int, str, str]] | None:
+        """重复组判读：返回 (id, verdict, reason) 列表；未配置 AI 或失败时返回 None。
+
+        与 suggest_areas 同一失败哲学：这是提示性信号，任何失败都不应中断分析。
+        """
+        if not self.ai_available or not group_payloads:
+            return None
+        items = [{"id": index, **payload} for index, payload in enumerate(group_payloads)]
+        user_text = "请判读以下同体积文件组：\n" + json.dumps(items, ensure_ascii=False)
+        if self.settings.ai_api_style == "responses":
+            endpoint = f"{self.settings.ai_base_url}/responses"
+            request_payload: dict[str, Any] = {
+                "model": self.settings.ai_model,
+                "instructions": DUPLICATE_SYSTEM_PROMPT,
+                "input": user_text,
+                "store": False,
+            }
+        else:
+            endpoint = f"{self.settings.ai_base_url}/chat/completions"
+            request_payload = {
+                "model": self.settings.ai_model,
+                "messages": [
+                    {"role": "system", "content": DUPLICATE_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+            }
+        try:
+            body = self._post_with_retries(endpoint, request_payload)
+            content = _response_text(body, self.settings.ai_api_style)
+            data = _extract_json(content)
+        except (AdvisorError, urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return None
+
+        raw = data.get("reviews")
+        if not isinstance(raw, list):
+            return None
+        reviews: list[tuple[int, str, str]] = []
+        seen: set[int] = set()
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            group_id = entry.get("id")
+            verdict = entry.get("verdict")
+            reason = entry.get("reason")
+            if not isinstance(group_id, int) or isinstance(group_id, bool):
+                continue
+            if not 0 <= group_id < len(group_payloads) or group_id in seen:
+                continue
+            if verdict not in DUPLICATE_VERDICTS or not isinstance(reason, str) or not reason.strip():
+                continue
+            seen.add(group_id)
+            reviews.append((group_id, verdict, reason.strip()[:40]))
+        return reviews or None
+
+    def _request_ai_batch(
+        self,
+        payloads: Sequence[dict[str, Any]],
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+        user_heading: str = "文件元数据",
+    ) -> list[Advice]:
+        endpoint, payload = self._build_request(
+            payloads, system_prompt=system_prompt, user_heading=user_heading
+        )
+        body = self._post_with_retries(endpoint, payload)
+        self.stats.api_items += len(payloads)
 
         content = _response_text(body, self.settings.ai_api_style)
         try:

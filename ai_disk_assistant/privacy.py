@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 
-from .models import FileMetadata
+from .models import FileMetadata, Unit
 from .safety import SAFE_CONTEXT_NAMES, normalized_parts
 
 PrivacyMode = Literal["strict", "balanced", "full"]
@@ -57,13 +57,13 @@ def anonymize_path(path: str) -> str:
 
 
 def metadata_for_ai(metadata: FileMetadata, mode: str = "balanced") -> dict[str, Any]:
+    """逐文件 AI 载荷。有意不含修改/访问时间：mtime 在 Windows 下不可靠，
+    不能作为判断依据；时间只随报告导出供人工参考。"""
     privacy_mode = normalize_privacy_mode(mode)
     common: dict[str, Any] = {
         "name": metadata.name,
         "suffix": metadata.suffix,
         "size_bytes": metadata.size_bytes,
-        "modified_time": metadata.modified_time,
-        "accessed_time": metadata.accessed_time,
     }
 
     if privacy_mode == "strict":
@@ -80,3 +80,29 @@ def metadata_for_ai(metadata: FileMetadata, mode: str = "balanced") -> dict[str,
     common["path"] = metadata.path
     common["parent_folder"] = metadata.parent_folder
     return common
+
+
+def unit_payload_for_ai(unit: Unit, mode: str = "balanced") -> dict[str, Any]:
+    """判定单元的 AI 载荷：统计字段对所有隐私档位可见，目录模式按档位裁剪。
+
+    有意不含年龄字段：mtime 在 Windows 下不可靠，不作为判断依据。
+    evidence 校验依赖"AI 原样引用输入字段"，因此这里的键名与取值即校验白名单。
+    """
+    privacy_mode = normalize_privacy_mode(mode)
+    payload: dict[str, Any] = {
+        "suffix": unit.suffix,
+        "file_count": unit.file_count,
+        "total_size_bytes": unit.total_size,
+        "sample_names": [member.name for member in unit.members[:3]],
+    }
+
+    if privacy_mode == "strict":
+        payload["directory_context"] = sorted(set(normalized_parts(unit.parent_folder)) & SAFE_CONTEXT_NAMES)
+        return payload
+
+    if privacy_mode == "balanced":
+        payload["path_pattern"] = anonymize_path(unit.parent_folder)
+        return payload
+
+    payload["path_pattern"] = unit.parent_folder
+    return payload
