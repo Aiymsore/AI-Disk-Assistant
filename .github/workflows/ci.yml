@@ -21,7 +21,7 @@ jobs:
         run: python -m pip install -r requirements-dev.txt
       - name: Lint
         run: python -m ruff check .
-      # 失败时把 FAIL/ERROR 行转成 ::error:: 注解：注解可经公开 API 读取，无需仓库管理员权限。
+      # 失败时把测试输出逐行转成 ::error:: 注解：注解可经公开 API 读取，无需仓库管理员权限。
       - name: Tests with coverage
         shell: bash
         run: |
@@ -29,8 +29,11 @@ jobs:
           python -m coverage run -m unittest discover -s tests -v 2>&1 | tee tests-output.txt
           code=${PIPESTATUS[0]}
           if [ "$code" != "0" ]; then
-            grep -E "^(FAIL|ERROR):" tests-output.txt | while IFS= read -r line; do echo "::error::$line"; done
-            tail -n 80 tests-output.txt
+            n=0
+            while IFS= read -r line; do
+              n=$((n+1))
+              echo "::error title=ci-line-$n::$line"
+            done < tests-output.txt
             exit "$code"
           fi
       - name: Coverage report
