@@ -6,7 +6,7 @@ CI 诊断工具：job 日志只有仓库管理员能读，而 ::error:: 注解�
 
 from pathlib import Path
 
-LINES_PER_FILE = 8
+LINES_PER_FILE = 10
 
 
 def main() -> None:
