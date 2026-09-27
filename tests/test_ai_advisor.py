@@ -12,6 +12,7 @@ from ai_disk_assistant.ai_advisor import (
     AdvisorError,
     HybridAdvisor,
     _validate_advice,
+    _validate_unit_evidence,
 )
 from ai_disk_assistant.cache import AdviceCache
 from ai_disk_assistant.config import Settings
@@ -266,6 +267,112 @@ class PromptEnumSyncTests(unittest.TestCase):
         for field in ("suffix", "file_count", "path_pattern"):
             self.assertIn(f"{field}=", UNIT_SYSTEM_PROMPT)
             self.assertIn(field, payload)
+
+
+class EvidenceLengthTests(unittest.TestCase):
+    """回归：路径型证据的真实取值长度必须能通过校验。
+
+    事故复盘：上限 80 时，AI 如实引用深层目录的 path_pattern（90+ 字符）被整批拒绝，
+    二分重试全败后全部候选兜底成"人工确认"，AI 判读形同虚设。
+    """
+
+    def test_long_path_evidence_passes_validation_and_gate(self) -> None:
+        deep = r"D:\百度网盘\BaiduNetdisk\module\BrowserEngine\BrowserEngine\resources\web\locales"
+        evidence = [f"path_pattern={deep}"]
+        self.assertGreater(len(evidence[0]), 80)  # 旧上限（80）必然拒掉的长度
+        advice = _validate_advice(
+            {
+                "recommend_delete": False,
+                "purpose": "程序配置文件",
+                "advice_level": "人工确认",
+                "reason": "程序目录中的运行库",
+                "evidence": evidence,
+            }
+        )
+        self.assertEqual(advice.evidence, evidence)
+        self.assertTrue(_validate_unit_evidence({"path_pattern": deep}, evidence))
+
+
+class DescribeTaskTests(unittest.TestCase):
+    """文件介绍任务：结构化校验、结果对齐、缓存复用、失败语义。"""
+
+    def _advisor(self, temp_dir: str) -> HybridAdvisor:
+        settings = Settings(
+            "secret",
+            "https://example.invalid/v1",
+            "demo",
+            1,
+            ai_max_retries=0,
+            ai_retry_backoff=0.0,
+            ai_cache_path=f"{temp_dir}/c.sqlite3",
+        )
+        return HybridAdvisor(settings)
+
+    def test_describe_items_aligned_and_cached(self) -> None:
+        payloads = [
+            {"kind": "文件", "name": "libcef.dll", "path": "D:\\App", "suffix": ".dll", "size_bytes": 1},
+            {"kind": "目录", "name": "Cache", "path": "D:\\App\\Cache",
+             "total_size_bytes": 10, "file_count": 2, "top_suffixes": []},
+        ]
+        body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "descriptions": [
+                                    {"id": 0, "what": "CEF 浏览器框架库", "impact": "程序无法启动", "handle": "别动"},
+                                    {"id": 1, "what": "应用缓存目录", "impact": "可重新生成", "handle": "可清理"},
+                                ]
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            advisor = self._advisor(temp_dir)
+            with patch("urllib.request.urlopen", return_value=FakeResponse(body)):
+                first = advisor.describe_items(payloads)
+            self.assertEqual([item.handle for item in first], ["别动", "可清理"])
+            self.assertEqual(first[0].what, "CEF 浏览器框架库")
+            self.assertEqual(advisor.stats.api_calls, 1)
+
+            with patch("urllib.request.urlopen") as mocked:
+                second = advisor.describe_items(payloads)
+            mocked.assert_not_called()
+            self.assertEqual(second, first)
+            self.assertEqual(advisor.stats.cache_hits, 2)
+
+    def test_invalid_handle_rejected(self) -> None:
+        body = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {"descriptions": [{"id": 0, "what": "x", "impact": "y", "handle": "建议删除"}]},
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ],
+            "usage": {},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            advisor = self._advisor(temp_dir)
+            with patch("urllib.request.urlopen", return_value=FakeResponse(body)):
+                with self.assertRaises(AdvisorError):
+                    advisor.describe_items(
+                        [{"kind": "文件", "name": "a", "path": "C:\\a", "suffix": ".a", "size_bytes": 1}]
+                    )
+
+    def test_without_ai_raises(self) -> None:
+        settings = Settings(None, "https://example.invalid/v1", "demo", 1, ai_cache_path="")
+        advisor = HybridAdvisor(settings, enable_ai=True)
+        with self.assertRaises(AdvisorError):
+            advisor.describe_items([{"kind": "文件", "name": "a", "path": "C:\\a"}])
 
 
 if __name__ == "__main__":

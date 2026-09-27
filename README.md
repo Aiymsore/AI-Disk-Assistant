@@ -28,7 +28,8 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 
 | 任务 | 触发位置 | 输入 | 失败时的行为 |
 |---|---|---|---|
-| **判定单元判读**（核心） | 评审管线 `advise_units` | 同目录+同后缀+同大小档的文件组聚合统计 | 降级到本地规则/安全兜底，不中断 |
+| **文件介绍**（GUI 评审核心） | GUI「AI 介绍所选」`describe_items` | 选中文件/目录的元数据（名称、路径模式、大小、聚合统计） | 抛错由界面弹窗呈现，不影响其他功能 |
+| **判定单元判读** | CLI analyze 评分管线 `advise_units` | 同目录+同后缀+同大小档的文件组聚合统计 | 降级到本地规则/安全兜底，不中断 |
 | **区域圈选**（建议性） | 全盘分析阶段一 `suggest_areas` | 体积 top 目录摘要 | 返回 None，回退体积启发式 |
 | **重复组判读**（提示性） | 全盘分析 `review_duplicates` | 同体积文件组 | 返回 None，仅放弃提示 |
 | **深度分析综述**（展示性） | `analyze_root` 收尾 / GUI「AI 深度分析」 | 整目录聚合事实（排名、后缀构成、最大文件、重复组、评审分布） | 返回 None，不写综述、不影响任何判定 |
@@ -65,7 +66,7 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 | `main.py` | CLI 启动脚本，转发到 `ai_disk_assistant.cli.main` |
 | `gui.py`（根目录） | GUI 启动脚本，转发到 `ai_disk_assistant.gui.main` |
 | `ai_disk_assistant/cli.py` | 子命令 `inspect`（判断单个文件，走逐文件管线）与 `analyze`（整卷区域分析）；前置条件校验、参数解析、控制台输出 |
-| `ai_disk_assistant/gui.py` | Tkinter 界面 + 纯 ttk 视觉系统（`_setup_style`，DPI 感知适配高分屏）：卷选择、扫描控制（暂停/继续/取消）、目录下钻浏览（双击进入）、扩展名分类面板、选中送 AI 评审（结果按"只看建议清理"折叠人工确认）、行首方框勾选 + 「删除勾选」（移入回收站）、`AIConfigDialog` 图形编辑 .env。扫描/评审/删除跑后台线程，经事件队列回主线程刷新 |
+| `ai_disk_assistant/gui.py` | Tkinter 界面 + 纯 ttk 视觉系统（`_setup_style`，DPI 感知适配高分屏）：卷选择、扫描控制（暂停/继续/取消）、目录下钻浏览（双击进入）、扩展名分类面板、选中让 AI 介绍（是什么/删除影响/处理建议，可只看"可清理"）、行首方框勾选 + 「删除勾选」（移入回收站）、`AIConfigDialog` 图形编辑 .env。扫描/介绍/删除跑后台线程，经事件队列回主线程刷新 |
 
 ### 扫描层
 
@@ -94,7 +95,7 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 
 | 文件 | 职责 |
 |---|---|
-| `ai_disk_assistant/ai_advisor.py` | `HybridAdvisor` 主入口：`advise_units`（单元管线，见上）+ `advise`/`advise_many`（逐文件管线，CLI inspect 用）+ `suggest_areas`/`review_duplicates`（建议性任务）+ `probe`（连接测试）。`_validate_advice` 严格校验，`_request_ai_batch_resilient` 二分降级，`build_advisor` 为 CLI/GUI 共用工厂 |
+| `ai_disk_assistant/ai_advisor.py` | `HybridAdvisor` 主入口：`describe_items`（文件介绍，GUI 评审核心）+ `advise_units`（单元管线，CLI analyze 用）+ `advise`/`advise_many`（逐文件管线，CLI inspect 用）+ `suggest_areas`/`review_duplicates`（建议性任务）+ `probe`（连接测试）。`_validate_advice` 严格校验，`_request_batch_resilient` 二分降级，`build_advisor` 为 CLI/GUI 共用工厂 |
 | `ai_disk_assistant/cache.py` | SQLite 建议缓存（WAL），键由 `make_key` 统一构造 |
 | `ai_disk_assistant/privacy.py` | 三档隐私裁剪 + 路径匿名化（`anonymize_path`），载荷键名即证据校验白名单 |
 | `ai_disk_assistant/units.py` | 判定单元归并：`size_bucket` 大小分桶（桶边界一经发布只能追加）、`unit_fingerprint` 稳定模式指纹、`build_units` 按最高候选分降序输出 |
@@ -125,8 +126,9 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 
 1. GUI 选卷 → 管理员权限校验 → `snapshot_volume` 直读 $MFT 建快照（唯一事实来源），完成后自动回收旧快照
 2. 目录树双击下钻，数据全部来自快照库（毫秒级）；扩展名面板同步聚合
-3. 勾选目录/文件 → 快照事实评分 → 归并判定单元 → `advise_units`（守卫 → 缓存 → AI → 证据闸门 → 决策表）
-4. 候选列表按建议等级着色，报告落盘（CSV/JSON/HTML）；自动流程不执行任何删除
+3. 选中目录/文件 → `describe_items`：AI 介绍"是什么 / 删除影响 / 处理建议（可清理/需核对/别动）"，
+   结果按处理建议着色、可只看"可清理"；纯展示任务，不经过守卫与判定管线，不参与任何自动行为
+4. 自动流程不执行任何删除；介绍结果缓存复用（提示词版本进缓存键）
 5. **手动删除（可选）**：列表行首方框勾选文件/目录（点表头全选）→ 顶栏「删除勾选」→
    二次确认（显示文件数/体积/被拒目标）→ `plan_deletion` 展开子树并拒绝受保护路径 →
    `recycle_paths` 移入回收站 → 按磁盘事实回删快照行并刷新目录聚合与当前视图

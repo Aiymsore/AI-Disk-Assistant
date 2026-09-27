@@ -1,12 +1,14 @@
-"""图形界面层（Tkinter）：WizTree 式磁盘浏览器 + 选中送 AI 评审 + 勾选手动删除。
+"""图形界面层（Tkinter）：WizTree 式磁盘浏览器 + AI 文件介绍 + 勾选手动删除。
 
 布局：顶栏（选卷/扫描/暂停取消/删除勾选 + AI 工具 + 权限）→ 空间头（总/已用/可用/耗时）→
 主区（左侧当前目录列表：行首方框标记删除、目录在前、大小降序、双击下钻；右侧扩展名分类面板）→
-底部（选中送 AI 评审 + 变色候选列表与判断依据）。不做全量树与 treemap：
-浏览式下钻一次只查一层（SQLite 毫秒级），评审目标由用户选中决定。
+底部（选中让 AI 介绍"是什么/删除影响/处理建议" + 变色结果列表）。不做全量树与 treemap：
+浏览式下钻一次只查一层（SQLite 毫秒级）。
 扫描支持暂停/继续/取消与百分比进度（ScanControl）。
-自动流程（扫描/评审/报告/综述）不做任何删除动作；唯一删除入口是行首方框勾选 +
-「删除勾选」按钮二次确认，由 cleaner.py 执行（移入回收站，受保护目录拒绝）。
+评审不经过本地守卫与删除建议管线：AI 介绍是纯展示任务（describe_items），
+失败直接报错呈现；唯一的执行级保护在 cleaner 层（受保护目录拒绝移入回收站）。
+自动流程（扫描/介绍/报告/综述）不做任何删除动作；唯一删除入口是行首方框勾选 +
+「删除勾选」按钮二次确认，由 cleaner.py 执行（移入回收站）。
 """
 
 from __future__ import annotations
@@ -51,35 +53,24 @@ from .config import (
     read_dotenv,
     update_dotenv,
 )
-from .inventory import FileRow, Inventory
+from .inventory import DirAgg, FileRow, Inventory
 from .metadata import format_mtime, format_pct, format_size
 from .mft_scanner import MftError, ScanCancelled, ScanControl, snapshot_volume, volume_capacity
-from .models import Candidate, FileMetadata, ScanStats
+from .models import FileDescription
 from .overview import build_overview_payload
-from .report import default_report_path, write_all_reports, write_overview_markdown
-from .scanner import ScanPolicy, _signals_from_facts, judge_metadata_records
-
-def _review_stats(scored: int, kept: int, unit_count: int) -> "ScanStats":
-    stats = ScanStats(root="review")
-    stats.visited_files = scored
-    stats.matched_candidates = scored
-    stats.retained_candidates = kept
-    stats.unit_count = unit_count
-    stats.units_judged = unit_count  # 无数量上限：全部单元实判。
-    return stats
+from .privacy import anonymize_path
+from .report import default_report_path, write_overview_markdown
 
 
-# 建议等级 → 行前景色（"变色"映射）：危险程度越高越红，保守结论越绿。
-LEVEL_COLORS = {
-    "建议删除": "#c0392b",
-    "谨慎删除": "#d68910",
-    "人工确认": "#2874a6",
-    "不建议删除": "#1e8449",
+# 处理建议 → 行前景色：可清理是"放心动手"用绿，别动是警告用红，需核对居中用橙。
+HANDLE_COLORS = {
+    "可清理": "#1e8449",
+    "需核对": "#d68910",
+    "别动": "#c0392b",
 }
 
-# "建议清理"层级：AI 明确倾向清理的两档。底部候选列表默认只显示这两档，
-# 人工确认/不建议删除通过"只看建议清理"开关随时展开（数据不丢，只是折叠显示）。
-_CLEANUP_LEVELS = {"建议删除", "谨慎删除"}
+# 单次 AI 介绍的目标数上限：一次请求批量可控，超出按体积取前 N 项。
+_DESCRIBE_MAX_ITEMS = 100
 
 _DIR_TAG = "dir"
 _FILE_TAG = "file"
@@ -451,7 +442,7 @@ class DiskAssistantGUI:
             self.root.iconphoto(True, icon)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.last_html: Path | None = None
-        self.reviewed_candidates: list[Candidate] = []
+        self.reviewed_descriptions: list[FileDescription] = []
         self._busy = False
         # 行首方框的删除标记（按路径），跨目录导航保留；重新扫描后清空。
         self._delete_marks: set[str] = set()
@@ -560,8 +551,8 @@ class DiskAssistantGUI:
         self.list_tree.heading("check", command=self._toggle_all_marks)
         self.list_tree.tag_configure(_DIR_TAG, background=COLOR_DIR_ROW)
         self.list_tree.tag_configure(_STRIPE_TAG, background=COLOR_STRIPE)
-        for level, color in LEVEL_COLORS.items():
-            self.list_tree.tag_configure(f"reviewed:{level}", foreground=color)
+        for handle, color in HANDLE_COLORS.items():
+            self.list_tree.tag_configure(f"desc:{handle}", foreground=color)
         list_scroll = ttk.Scrollbar(list_frame, orient=VERTICAL, command=self.list_tree.yview)
         self.list_tree.configure(yscrollcommand=list_scroll.set)
         self.list_tree.pack(side=LEFT, fill=BOTH, expand=True)
@@ -588,18 +579,18 @@ class DiskAssistantGUI:
         ext_scroll.pack(side=RIGHT, fill="y")
         main.add(ext_frame, weight=1)
 
-        # 底部：选中送 AI 评审 + 变色候选列表（与行首删除方框互不相干）
+        # 底部：选中送 AI 介绍 + 变色结果列表（与行首删除方框互不相干）
         review_bar = ttk.Frame(self.root, padding=(px(14), px(6), px(14), 0))
         review_bar.pack(fill="x")
         ttk.Label(
             review_bar,
-            text="在列表中选中（高亮）目录/文件后送 AI 评审（行首方框是手动删除标记，与评审无关）：",
+            text="选中（高亮）目录/文件后让 AI 介绍它是什么、删除有何影响（行首方框是手动删除标记）：",
         ).pack(side=LEFT)
-        # 折叠开关：默认只显示"建议删除/谨慎删除"，人工确认等大量不确定项不刷屏。
-        self.only_cleanup_var = BooleanVar(value=True)
+        # 折叠开关：默认全部显示（介绍本身就是有效信息），勾选后只看"可清理"项。
+        self.only_cleanup_var = BooleanVar(value=False)
         ttk.Checkbutton(
             review_bar,
-            text="只看建议清理",
+            text="只看可清理",
             variable=self.only_cleanup_var,
             command=self._apply_review_filter,
         ).pack(side=LEFT, padx=(px(12), 0))
@@ -612,39 +603,35 @@ class DiskAssistantGUI:
         )
         self.overview_button.pack(side=RIGHT, padx=(0, px(8)))
         self.review_button = ttk.Button(
-            review_bar, text="评审所选 → AI", style="Primary.TButton", command=self._review_selected
+            review_bar, text="AI 介绍所选", style="Primary.TButton", command=self._review_selected
         )
         self.review_button.pack(side=RIGHT)
 
         review_frame = ttk.Frame(self.root, style="Card.TFrame", padding=1)
         review_frame.pack(fill=BOTH, expand=True, padx=px(14), pady=(px(4), 0))
-        review_columns = ("size", "level", "purpose", "source", "reason", "evidence", "path")
+        review_columns = ("size", "handle", "what", "impact", "path")
         self.review_tree = ttk.Treeview(
             review_frame, columns=review_columns, show="headings", height=8
         )
         review_headings = {
             "size": "大小",
-            "level": "建议等级",
-            "purpose": "用途",
-            "source": "判断来源",
-            "reason": "理由",
-            "evidence": "判断依据",
+            "handle": "处理建议",
+            "what": "是什么",
+            "impact": "删除影响",
             "path": "路径",
         }
         review_widths = {
             "size": 90,
-            "level": 90,
-            "purpose": 120,
-            "source": 105,
-            "reason": 220,
-            "evidence": 220,
+            "handle": 90,
+            "what": 320,
+            "impact": 300,
             "path": 330,
         }
         for column in review_columns:
             self.review_tree.heading(column, text=review_headings[column])
             self.review_tree.column(column, width=px(review_widths[column]), minwidth=px(60))
-        for level, color in LEVEL_COLORS.items():
-            self.review_tree.tag_configure(level, foreground=color)
+        for handle, color in HANDLE_COLORS.items():
+            self.review_tree.tag_configure(handle, foreground=color)
         self.review_tree.tag_configure(_STRIPE_TAG, background=COLOR_STRIPE)
         review_scroll = ttk.Scrollbar(review_frame, orient=VERTICAL, command=self.review_tree.yview)
         self.review_tree.configure(yscrollcommand=review_scroll.set)
@@ -825,7 +812,7 @@ class DiskAssistantGUI:
                 tags=tags,
                 values=(stats["suffix"], format_size(int(stats["size_bytes"])), stats["file_count"]),
             )
-        self.status_var.set(status_extra + f"（共 {len(rows)} 项，选中后可送 AI 评审）")
+        self.status_var.set(status_extra + f"（共 {len(rows)} 项，选中后可让 AI 介绍）")
 
     def _on_double_click(self, event) -> None:
         if self.list_tree.identify_column(event.x) == "#1":
@@ -976,7 +963,7 @@ class DiskAssistantGUI:
             self.used_bytes, _count = self.inventory.volume_usage(self.snapshot_id)
             self._enter_dir(drive, max(self.used_bytes, 1))
 
-    # ── AI 评审（勾选 → 送评审）─────────────────────────────────────────
+    # ── AI 介绍（选中 → 这是什么/删除影响/处理建议）─────────────────────
     def _review_selected(self) -> None:
         if self.snapshot_id is None:
             messagebox.showinfo("尚未扫描", "请先完成一次扫描。")
@@ -985,7 +972,7 @@ class DiskAssistantGUI:
         blockers = [b for b in analysis_blockers(advisor.ai_available) if "管理员" not in b]
         if blockers:
             messagebox.showerror(
-                "无法评审",
+                "无法介绍",
                 "AI 未配置：请点击\"AI 配置\"填写密钥与模型。\n" + "\n".join(blockers),
             )
             return
@@ -993,69 +980,103 @@ class DiskAssistantGUI:
         selection = self.list_tree.selection()
         if not selection:
             messagebox.showinfo(
-                "未选择", "请先在列表中选中（高亮）要评审的目录或文件（Ctrl/Shift 可多选）。"
+                "未选择", "请先在列表中选中（高亮）要介绍的目录或文件（Ctrl/Shift 可多选）。"
             )
             return
 
-        rows: list[FileRow] = []
+        # 介绍按"选中项自身"逐条生成：目录整体一条（含聚合统计），文件一条。
+        entries: list[tuple[int, FileDescription, dict]] = []
         for item in selection:
             tags = self.list_tree.item(item, "tags")
             if tags and tags[0] == _DIR_TAG:
-                rows += self.inventory.files_under(self.snapshot_id, item)
+                entries.append(self._dir_describe_entry(item))
             elif item in self.loose_rows:
-                rows.append(self.loose_rows[item])
-        if not rows:
-            messagebox.showinfo("无可评审内容", "所选目标下没有可评分的文件。")
+                entries.append(self._file_describe_entry(self.loose_rows[item]))
+        if not entries:
+            messagebox.showinfo("无可介绍内容", "所选目标没有可用的快照信息。")
             return
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        note = ""
+        if len(entries) > _DESCRIBE_MAX_ITEMS:
+            entries = entries[:_DESCRIBE_MAX_ITEMS]
+            note = f"（选中较多，已按体积取前 {_DESCRIBE_MAX_ITEMS} 项）"
+        metas = [entry[1] for entry in entries]
+        payloads = [entry[2] for entry in entries]
 
         self._set_busy(True)
-        self.review_button.configure(state="disabled")
-        self.status_var.set(f"正在评审 {len(rows)} 个文件（勾选目标子树）……")
-        area_path = Path(self.current_dir or self.volume_var.get())
+        self.status_var.set(f"正在让 AI 介绍 {len(metas)} 个目标{note}……")
         threading.Thread(
-            target=self._review_worker,
-            args=(rows, area_path, advisor),
-            daemon=True,
+            target=self._describe_worker, args=(metas, payloads, advisor), daemon=True
         ).start()
 
-    def _review_worker(self, rows: list[FileRow], area_path: Path, advisor) -> None:
+    def _dir_describe_entry(self, item: str) -> tuple[int, FileDescription, dict]:
+        """目录介绍条目：聚合统计取自快照库；路径按隐私档裁剪后发给 AI。"""
+        agg = self._dir_agg(item)
+        name = Path(item).name or item
+        total = agg.total_size if agg else 0
+        meta = FileDescription(
+            path=item, name=name, kind="目录", size_text=format_size(total),
+            what="", impact="", handle="需核对",
+        )
+        payload: dict[str, object] = {
+            "kind": "目录",
+            "name": name,
+            "path": item,
+            "total_size_bytes": total,
+            "file_count": agg.file_count if agg else 0,
+            "top_suffixes": agg.top_suffixes if agg else [],
+        }
+        return total, meta, self._anonymize_payload(payload)
+
+    def _file_describe_entry(self, row: FileRow) -> tuple[int, FileDescription, dict]:
+        meta = FileDescription(
+            path=row.path, name=row.name, kind="文件", size_text=format_size(row.size_bytes),
+            what="", impact="", handle="需核对",
+        )
+        payload: dict[str, object] = {
+            "kind": "文件",
+            "name": row.name,
+            "path": row.path,
+            "suffix": row.suffix,
+            "size_bytes": row.size_bytes,
+        }
+        return row.size_bytes, meta, self._anonymize_payload(payload)
+
+    def _anonymize_payload(self, payload: dict[str, object]) -> dict[str, object]:
+        """介绍载荷只做路径匿名化（balanced）；strict 档用户走 CLI，不在 GUI 出现。"""
+        payload["path"] = anonymize_path(str(payload["path"]))
+        return payload
+
+    def _dir_agg(self, directory: str) -> DirAgg | None:
+        rows = self.inventory.child_dirs(self.snapshot_id or 0, str(Path(directory).parent))
+        for row in rows:
+            if row.path == directory:
+                return row
+        return None
+
+    def _describe_worker(
+        self, metas: list[FileDescription], payloads: list[dict], advisor
+    ) -> None:
+        """后台线程：批量请求 AI 介绍（纯展示任务，不写报告、不触判定管线）。"""
         started = time.perf_counter()
-        stats_holder: dict = {}
         try:
-            policy = ScanPolicy()
-            records: list[tuple[FileMetadata, str, float]] = []
-            for row in rows:
-                signal = _signals_from_facts(row.path, row.suffix, row.size_bytes, area_path, policy)
-                if signal is None:
-                    continue
-                reason, score, _size = signal
-                metadata = FileMetadata(
-                    path=row.path,
-                    name=row.name,
-                    suffix=row.suffix,
-                    parent_folder=str(Path(row.path).parent),
-                    size_bytes=row.size_bytes,
-                    size_text=format_size(row.size_bytes),
-                    modified_time="—",
-                    accessed_time="—",
-                    modified_time_ns=row.mtime_ns,
-                    accessed_time_ns=row.mtime_ns,
+            results = advisor.describe_items(payloads)
+            descriptions = [
+                FileDescription(
+                    path=meta.path,
+                    name=meta.name,
+                    kind=meta.kind,
+                    size_text=meta.size_text,
+                    what=item.what,
+                    impact=item.impact,
+                    handle=item.handle,
                 )
-                records.append((metadata, reason, score))
-            if not records:
-                self.events.put(("review_done", ([], advisor.stats)))
-                return
-            candidates, unit_count = judge_metadata_records(records, advisor, policy)
-            stats = advisor.stats
-            stats_holder["html"] = write_all_reports(
-                candidates,
-                _review_stats(len(records), len(candidates), unit_count),
-                stats.to_dict(),
-            ).html
+                for meta, item in zip(metas, results, strict=True)
+            ]
             elapsed = time.perf_counter() - started
-            self.events.put(("review_done", (candidates, stats, stats_holder.get("html"), elapsed)))
+            self.events.put(("review_done", (descriptions, advisor.stats, elapsed)))
         except Exception as exc:
-            self.events.put(("review_error", str(exc)))
+            self.events.put(("review_error", f"{type(exc).__name__}: {exc}"))
 
     # ── AI 深度分析：自由综述（等价于"把磁盘占用截图发给 AI"）──────────────
     def _start_overview(self) -> None:
@@ -1173,50 +1194,40 @@ class DiskAssistantGUI:
             return image
         return None
 
-    def _fill_review_rows(self, candidates: list[Candidate]) -> None:
-        self.reviewed_candidates = list(candidates)
+    def _fill_review_rows(self, descriptions: list[FileDescription]) -> None:
+        self.reviewed_descriptions = list(descriptions)
         self._apply_review_filter()
-        # 列表内已评审的文件行同步着色（可见即所得）。
-        by_path = {candidate.metadata.path: candidate for candidate in candidates}
+        # 列表内已介绍的行按处理建议着色（可见即所得）。
+        by_path = {desc.path: desc for desc in descriptions}
         for item in self.list_tree.get_children():
-            candidate = by_path.get(item)
-            if candidate is not None:
-                self.list_tree.item(item, tags=(f"reviewed:{candidate.advice.advice_level}",))
+            desc = by_path.get(item)
+            if desc is not None:
+                self.list_tree.item(item, tags=(f"desc:{desc.handle}",))
 
     def _apply_review_filter(self) -> None:
-        """按"只看建议清理"开关重渲染候选列表：数据完整保留，只控制显示范围。"""
+        """按"只看可清理"开关重渲染介绍列表：数据完整保留，只控制显示范围。"""
         self.review_tree.delete(*self.review_tree.get_children())
         only_cleanup = self.only_cleanup_var.get()
         shown = 0
-        hidden_uncertain = 0
-        for candidate in self.reviewed_candidates:
-            level = candidate.advice.advice_level
-            if only_cleanup and level not in _CLEANUP_LEVELS:
-                if level == "人工确认":
-                    hidden_uncertain += 1
+        hidden = 0
+        for desc in self.reviewed_descriptions:
+            if only_cleanup and desc.handle != "可清理":
+                hidden += 1
                 continue
-            tags = (level, _STRIPE_TAG) if shown % 2 else (level,)
+            tags = (desc.handle, _STRIPE_TAG) if shown % 2 else (desc.handle,)
             self.review_tree.insert(
                 "",
                 END,
                 tags=tags,
-                values=(
-                    candidate.metadata.size_text,
-                    level,
-                    candidate.advice.purpose,
-                    candidate.advice.source,
-                    candidate.advice.reason,
-                    "；".join(candidate.advice.evidence),
-                    candidate.metadata.path,
-                ),
+                values=(desc.size_text, desc.handle, desc.what, desc.impact, desc.path),
             )
             shown += 1
 
-        total = len(self.reviewed_candidates)
+        total = len(self.reviewed_descriptions)
         if not total:
             self.review_count_label.configure(text="")
         elif shown < total:
-            self.review_count_label.configure(text=f"显示 {shown} / 共 {total} 条（已折叠 {total - shown} 条，含 {hidden_uncertain} 条人工确认）")
+            self.review_count_label.configure(text=f"显示 {shown} / 共 {total} 条（已折叠 {hidden} 条）")
         else:
             self.review_count_label.configure(text=f"共 {total} 条")
 
@@ -1257,7 +1268,7 @@ class DiskAssistantGUI:
                         )
                     self.status_var.set(
                         f"扫描完成：{file_count} 个文件，耗时 {elapsed:.1f} 秒。"
-                        "双击目录进入，选中后送 AI 评审；行首方框勾选后可删除（移入回收站）。"
+                        "双击目录进入；选中后让 AI 介绍，行首方框勾选后可删除（移入回收站）。"
                     )
                     self._go_root()
                 elif event == "scan_cancelled":
@@ -1274,19 +1285,17 @@ class DiskAssistantGUI:
                     self.status_var.set("扫描失败。")
                     messagebox.showerror("扫描失败", str(payload))
                 elif event == "review_done":
-                    candidates, stats, html_path, elapsed = payload  # type: ignore[misc]
-                    self.last_html = Path(html_path)
-                    self.review_tree.delete(*self.review_tree.get_children())
-                    self._fill_review_rows(candidates)
+                    descriptions, stats, elapsed = payload  # type: ignore[misc]
+                    self._fill_review_rows(descriptions)
                     self._set_busy(False)
                     self.status_var.set(
-                        f"评审完成：{len(candidates)} 个候选，耗时 {elapsed:.1f} 秒；"
-                        f"AI 请求 {stats.api_calls} 次，缓存命中 {stats.cache_hits} 项。报告：{html_path}"
+                        f"AI 介绍完成：{len(descriptions)} 项，耗时 {elapsed:.1f} 秒；"
+                        f"AI 请求 {stats.api_calls} 次，缓存命中 {stats.cache_hits} 项。"
                     )
                 elif event == "review_error":
                     self._set_busy(False)
-                    self.status_var.set("评审失败。")
-                    messagebox.showerror("评审失败", str(payload))
+                    self.status_var.set("AI 介绍失败。")
+                    messagebox.showerror("AI 介绍失败", str(payload))
                 elif event == "delete_done":
                     deleted, failed, refused, freed, elapsed = payload  # type: ignore[misc]
                     self._delete_marks.difference_update(deleted)

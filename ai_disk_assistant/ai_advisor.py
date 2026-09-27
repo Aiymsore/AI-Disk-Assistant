@@ -14,12 +14,13 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, replace
 from itertools import islice
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NamedTuple, Sequence
 
 from .cache import AdviceCache
 from .config import Settings
 from .models import (
     ADVICE_LEVELS,
+    DESCRIPTION_HANDLES,
     EVIDENCE_MAX_ITEMS,
     EVIDENCE_MAX_LENGTH,
     PURPOSES,
@@ -153,7 +154,7 @@ ANALYZE_SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的目录区域�
 """
 
 # 判定单元提示词版本：进入单元判定缓存键。任何提示词变更都必须递增，旧缓存自动失效。
-PROMPT_VERSION = "unit-prompt-4"
+PROMPT_VERSION = "unit-prompt-5"
 
 UNIT_SYSTEM_PROMPT = """你是 Windows 磁盘清理工具中的文件组安全建议模块。
 输入是"判定单元"：同一目录下、同后缀、大小同档的一组文件的聚合统计。
@@ -187,7 +188,8 @@ reason 写法（不超过 60 个中文字符）：一句话 = 定性 + 关键依
 - "同后缀同档大小，可能是日志轮转也可能是导出数据，建议抽查"
 evidence 规则：必须从输入字段中原样引用至少 1 条，格式为"字段名=值"，
 例如 "suffix=.tmp"、"file_count=15"、"path_pattern=C:\\Windows\\Temp"；
-不得编造输入中没有的事实。
+优先引用单值字段（suffix/file_count/total_size_bytes/path_pattern），
+不要引用 sample_names 这类列表字段；不得编造输入中没有的事实。
 对每个输入 id 返回一条结果，不遗漏、不新增；只输出 JSON 对象，不输出 Markdown。
 
 输出格式：
@@ -196,6 +198,36 @@ evidence 规则：必须从输入字段中原样引用至少 1 条，格式为"�
 purpose 只能是：缓存文件、临时文件、日志文件、安装包或下载残留、程序配置文件、系统文件、用户文档、媒体文件、代码或项目文件、存档或备份文件、未知用途。拿不准时用"未知用途"，不要硬套。
 advice_level 只能是：建议删除、谨慎删除、不建议删除、人工确认。
 """
+
+# ── 文件介绍（展示性任务）提示词：替代 GUI 评审里的删除建议管线 ───────────
+# 定位与综述一致：只产出给人看的信息，永远不写回 recommend_delete，
+# 因此不需要证据闸门与本地守卫——守卫的执行保护在 cleaner 层单独保留。
+DESCRIBE_SYSTEM_PROMPT = """你是 Windows 系统里的"文件讲解员"。用户给你一批文件或目录的元数据
+（路径、名称、后缀、大小、数量、主要后缀构成等），你要用人话解释它们是什么。
+
+对每一项输出三个字段：
+- what：这是什么。尽量具体到程序/游戏/框架/缓存类型
+  （如"libcef.dll 是 CEF 嵌入式浏览器框架库"、"方舟目录是游戏《方舟：生存飞升》的安装目录"）；
+  依据不足时写"可能是"，不要编造确切结论。
+- impact：删除会有什么影响。一句话说清（程序将无法启动/可随时重新生成/
+  不影响系统但浪费空间/可能丢失个人数据）。
+- handle：处理建议，只能是：可清理（临时文件、缓存、崩溃转储、冗余安装包等
+  删除收益明确的）/ 需核对（可能是重要数据，删前需确认）/ 别动（系统或程序运行必需）。
+
+规则：
+1. 只依据输入元数据推断，不得声称读取过文件内容；路径可能已匿名化
+  （%USERPROFILE%、<USER>），按目录结构与命名模式判断，不要因路径被遮蔽而拒绝下结论。
+2. 系统/程序目录中的文件倾向"别动"；Cache/Temp/Logs/CrashDumps 上下文或
+  .tmp/.log/.dmp 等后缀明确"可清理"；.db/.dat 等可能是个人数据的写"需核对"。
+3. what/impact 都不超过 60 个中文字符，直说结论，不要套话。
+4. 对每个输入 id 返回一条结果，不遗漏、不新增；只输出 JSON 对象，不输出 Markdown。
+
+输出格式：
+{"descriptions":[{"id":0,"what":"CEF 嵌入式浏览器框架库（Chromium 内核）","impact":"删除后依赖它的程序将无法启动","handle":"别动"}]}
+"""
+
+# 介绍任务提示词版本：进文本缓存键。任何提示词变更都必须递增。
+DESCRIBE_PROMPT_VERSION = "describe-prompt-1"
 
 
 # ── 错误类型与运行统计 ───────────────────────────────────────────────────
@@ -395,6 +427,14 @@ def _response_text(body: dict[str, Any], api_style: str) -> str:
 
 
 # ── 混合决策主体 ─────────────────────────────────────────────────────────
+class ItemDescription(NamedTuple):
+    """单项介绍结果：AI 只产出这三个字段，展示用的路径/大小由调用方补齐。"""
+
+    what: str
+    impact: str
+    handle: str
+
+
 class HybridAdvisor:
     """Local safety rules first; AI is advisory, batched, cached and failure-safe."""
 
@@ -668,19 +708,27 @@ class HybridAdvisor:
         system_prompt: str = SYSTEM_PROMPT,
         user_heading: str = "文件元数据",
     ) -> list[Advice]:
+        return self._request_batch_resilient(
+            payloads,
+            lambda chunk: self._request_ai_batch(
+                chunk, system_prompt=system_prompt, user_heading=user_heading
+            ),
+        )
+
+    def _request_batch_resilient(
+        self,
+        payloads: Sequence[Any],
+        request_fn,
+    ) -> list[Any]:
         """Split malformed/unsupported batches so one bad item does not discard all results."""
         try:
-            return self._request_ai_batch(payloads, system_prompt=system_prompt, user_heading=user_heading)
+            return request_fn(list(payloads))
         except BatchResponseError:
             if len(payloads) <= 1:
                 raise
             midpoint = len(payloads) // 2
-            left = self._request_ai_batch_resilient(
-                payloads[:midpoint], system_prompt=system_prompt, user_heading=user_heading
-            )
-            right = self._request_ai_batch_resilient(
-                payloads[midpoint:], system_prompt=system_prompt, user_heading=user_heading
-            )
+            left = self._request_batch_resilient(payloads[:midpoint], request_fn)
+            right = self._request_batch_resilient(payloads[midpoint:], request_fn)
             return left + right
 
     def _build_request(
@@ -689,9 +737,10 @@ class HybridAdvisor:
         *,
         system_prompt: str = SYSTEM_PROMPT,
         user_heading: str = "文件元数据",
+        user_verb: str = "判断",
     ) -> tuple[str, dict[str, Any]]:
         items = [{"id": index, **payload} for index, payload in enumerate(payloads)]
-        user_text = f"请逐项判断以下{user_heading}：\n" + json.dumps(items, ensure_ascii=False)
+        user_text = f"请逐项{user_verb}以下{user_heading}：\n" + json.dumps(items, ensure_ascii=False)
 
         if self.settings.ai_api_style == "responses":
             return (
@@ -953,6 +1002,105 @@ class HybridAdvisor:
         if self.cache is not None:
             self.cache.set_text(cache_key, key_material, narrative)
         return narrative
+
+    def describe_items(self, payloads: Sequence[dict[str, Any]]) -> list[ItemDescription]:
+        """文件介绍（展示性任务）：对每个文件/目录的元数据返回（是什么/删除影响/处理建议）。
+
+        与判定单元管线的三点差异（有意设计）：
+        - 不经过本地守卫与决策表——它不做删除判定，结果只用于界面展示；
+        - 不需要证据闸门——介绍是给人看的信息，不驱动任何自动行为；
+        - 失败（未配置 AI / 请求失败 / 校验不过）直接抛异常，由调用方决定如何呈现。
+        结果按"单条载荷内容 + 提示词版本"缓存，同类条目跨次评审零成本。
+        """
+        if not self.ai_available:
+            raise AdvisorError("请先在 .env 中配置 AI_API_KEY 和 AI_MODEL")
+        if not payloads:
+            return []
+
+        output: list[ItemDescription | None] = [None] * len(payloads)
+        pending: list[tuple[int, dict[str, Any], str]] = []
+        provider_identity = (
+            f"{self.settings.ai_base_url}|{self.settings.ai_api_style}|{self.settings.ai_model}"
+        )
+        for index, payload in enumerate(payloads):
+            cache_key = AdviceCache.make_key(
+                provider_identity,
+                self.settings.ai_privacy_mode,
+                {"kind": "describe", "prompt_version": DESCRIBE_PROMPT_VERSION, "item": payload},
+            )
+            cached_text = self.cache.get_text(cache_key) if self.cache is not None else None
+            if cached_text:
+                try:
+                    data = json.loads(cached_text)
+                    output[index] = ItemDescription(data["what"], data["impact"], data["handle"])
+                    self.stats.cache_hits += 1
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    pending.append((index, payload, cache_key))
+            else:
+                pending.append((index, payload, cache_key))
+
+        for batch in _batched(pending, self.settings.ai_batch_size):
+            batch_payloads = [entry[1] for entry in batch]
+            results = self._request_batch_resilient(batch_payloads, self._request_describe_batch)
+            for (index, payload, cache_key), description in zip(batch, results, strict=True):
+                output[index] = description
+                if self.cache is not None:
+                    self.cache.set_text(
+                        cache_key,
+                        payload,
+                        json.dumps(
+                            {"what": description.what, "impact": description.impact, "handle": description.handle},
+                            ensure_ascii=False,
+                        ),
+                    )
+
+        missing = [index for index, item in enumerate(output) if item is None]
+        if missing:  # pragma: no cover - defensive branch
+            raise AdvisorError(f"内部状态异常：{len(missing)} 条介绍未生成")
+        return [item for item in output if item is not None]
+
+    def _request_describe_batch(self, payloads: list[dict[str, Any]]) -> list[ItemDescription]:
+        endpoint, payload = self._build_request(
+            payloads, system_prompt=DESCRIBE_SYSTEM_PROMPT, user_heading="文件/目录", user_verb="介绍"
+        )
+        body = self._post_with_retries(endpoint, payload)
+        self.stats.api_items += len(payloads)
+
+        content = _response_text(body, self.settings.ai_api_style)
+        try:
+            data = _extract_json(content)
+            raw_results = data.get("descriptions")
+            if not isinstance(raw_results, list):
+                if len(payloads) == 1 and {"what", "impact", "handle"} <= data.keys():
+                    raw_results = [{"id": 0, **data}]
+                else:
+                    raise BatchResponseError("AI 结果缺少 descriptions 数组")
+            if len(raw_results) != len(payloads):
+                raise BatchResponseError("AI 返回数量与输入数量不一致")
+
+            indexed: dict[int, ItemDescription] = {}
+            for raw in raw_results:
+                if not isinstance(raw, dict) or not isinstance(raw.get("id"), int):
+                    raise BatchResponseError("AI 每条结果必须包含整数 id")
+                item_id = raw["id"]
+                if item_id in indexed or not 0 <= item_id < len(payloads):
+                    raise BatchResponseError("AI 返回了重复或越界 id")
+                what, impact, handle = raw.get("what"), raw.get("impact"), raw.get("handle")
+                for field_name, value in (("what", what), ("impact", impact)):
+                    if not isinstance(value, str) or not value.strip():
+                        raise BatchResponseError(f"AI 结果缺少有效的 {field_name}")
+                if handle not in DESCRIPTION_HANDLES:
+                    raise BatchResponseError("handle 不在允许范围内")
+                indexed[item_id] = ItemDescription(
+                    what.strip()[:200], impact.strip()[:200], handle
+                )
+            if len(indexed) != len(payloads):
+                raise BatchResponseError("AI 返回 id 不完整")
+            return [indexed[index] for index in range(len(payloads))]
+        except BatchResponseError:
+            raise
+        except AdvisorError as exc:
+            raise BatchResponseError(str(exc)) from exc
 
     def _request_ai_batch(
         self,

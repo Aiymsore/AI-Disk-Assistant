@@ -29,6 +29,9 @@ PURPOSES = {
 
 ADVICE_LEVELS = {"建议删除", "谨慎删除", "不建议删除", "人工确认"}
 
+# AI 文件介绍（展示性任务）的处理建议值域：不参与删除判定，只驱动界面着色与过滤。
+DESCRIPTION_HANDLES = {"可清理", "需核对", "别动"}
+
 # 建议理由的统一长度上限。两处使用、两种策略（均为有意设计）：
 # - ai_advisor._validate_advice：AI 返回超限直接报错（严格校验，防止提示词被无视）
 # - Advice.__post_init__：本地构造超限静默截断（兜底容错，保证任何来源都能落地）
@@ -36,8 +39,10 @@ REASON_MAX_LENGTH = 120
 
 # AI 判断必须附带"证据"：从输入中原样引用的事实（"字段名=值"），由证据校验层回数据库核对。
 # 上限与 reason 同策略：AI 返回超限直接报错（严格校验），本地构造超限静默截断（兜底容错）。
+# 长度上限必须容得下"路径型证据"的真实取值（深层目录的 path_pattern 轻松超过 80）——
+# 上限过紧会把 AI 的如实引用当成编造整批拒掉（实际事故：全部候选兜底成人工确认）。
 EVIDENCE_MAX_ITEMS = 6
-EVIDENCE_MAX_LENGTH = 80
+EVIDENCE_MAX_LENGTH = 200
 
 
 @dataclass(slots=True)
@@ -128,6 +133,28 @@ def safe_fallback_advice(reason: str, source: str = "local-fallback") -> Advice:
         reason=reason,
         source=source,
     )
+
+
+@dataclass(slots=True)
+class FileDescription:
+    """AI 文件介绍（展示性任务）：是什么 / 删除影响 / 处理建议。
+
+    与 Advice 的硬边界同综述叙事一致：介绍只进界面展示，永远不写回 recommend_delete，
+    因此不需要证据闸门——它是给用户看的信息，不是裁决。path/name/kind/size_text
+    由调用方（GUI）填入用于展示，AI 只产出 what/impact/handle 三个字段。
+    """
+
+    path: str
+    name: str
+    kind: str  # "文件" / "目录"
+    size_text: str
+    what: str
+    impact: str
+    handle: str
+
+    def __post_init__(self) -> None:
+        if self.handle not in DESCRIPTION_HANDLES:
+            self.handle = "需核对"
 
 
 @dataclass(slots=True)

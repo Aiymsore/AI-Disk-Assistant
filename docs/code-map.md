@@ -97,23 +97,24 @@ cli.command_scan / gui._scan_worker
 ### cache.py（81 行）— SQLite 建议缓存
 `AdviceCache`（cache.py:19）：`make_key`（47）= 模型+隐私模式+快照 payload 的 sha256；`get`（56）/ `set`（69）。仅 ai_advisor.py 使用。
 
-### ai_advisor.py（507 行）— AI 决策层
-| 分节 | 行号 | 说明 |
-|---|---|---|
-| `SYSTEM_PROMPT` | 34 | 枚举清单须与 models.PURPOSES/ADVICE_LEVELS 同步 |
-| `DEEP_ANALYSIS_SYSTEM_PROMPT` | — | 深度分析综述提示词（唯一不返回 JSON 的任务）；`OVERVIEW_PROMPT_VERSION` 进文本缓存键 |
-| `AdvisorStats` | 63 | token/耗时仅落盘 summary JSON，不在界面展示（有意保留） |
-| `_extract_json` / `_validate_advice` | 80 / 104 | 容错提取 JSON；严格校验字段与值域 |
-| `_clean_markdown` | — | 自由文本清理（剥掉模型习惯性包裹的 ``` 围栏） |
-| `_chat_content_to_text` / `_responses_content_to_text` | 143 / 160 | 两种 API 协议的文本抽取（共用 `_text_part_to_str`） |
-| `HybridAdvisor.advise_many` | 236 | 生产入口：本地守卫优先 → AI 批量 → 失败降级 |
-| `advise_ai_only_many` | 275 | **仅评测用**（run_benchmark.py），生产路径不走 |
-| `probe` | 285 | 用一个无害样本验证连通性与结构化输出 |
-| `_fallback_advice` / `_apply_hybrid_guard` | 301 / 314 | AI 失败降级；AI 建议删除时的双重本地闸门 |
-| `_request_ai_batch_resilient` | 373 | 坏样本二分拆批，避免整批报废 |
-| `_request_ai_batch` | 411 | HTTP + 重试（429/5xx 指数退避）+ id 完整性校验 |
-| `summarize_overview` | — | **深度分析综述**：自由 Markdown，走 `cache.get_text/set_text`，失败返回 None（绝不影响判定） |
-| `build_advisor` | 502 | CLI/GUI 共用的构造工厂（读 .env → Settings → HybridAdvisor） |
+### ai_advisor.py — AI 决策层
+| 分节 | 说明 |
+|---|---|
+| `DESCRIBE_SYSTEM_PROMPT` / `describe_items` | **文件介绍**（GUI 评审核心）：是什么/删除影响/处理建议，纯展示不落判定；走 `cache.get_text/set_text`（`DESCRIBE_PROMPT_VERSION` 进键） |
+| `SYSTEM_PROMPT` | 枚举清单须与 models.PURPOSES/ADVICE_LEVELS 同步 |
+| `DEEP_ANALYSIS_SYSTEM_PROMPT` | 深度分析综述提示词（唯一不返回 JSON 的任务）；`OVERVIEW_PROMPT_VERSION` 进文本缓存键 |
+| `AdvisorStats` | token/耗时仅落盘 summary JSON，不在界面展示（有意保留） |
+| `_extract_json` / `_validate_advice` | 容错提取 JSON；严格校验字段与值域 |
+| `_clean_markdown` | 自由文本清理（剥掉模型习惯性包裹的 ``` 围栏） |
+| `_chat_content_to_text` / `_responses_content_to_text` | 两种 API 协议的文本抽取（共用 `_text_part_to_str`） |
+| `HybridAdvisor.advise_units` / `advise_many` | 判定单元/逐文件管线（CLI analyze / inspect 用；GUI 评审已改走 describe_items） |
+| `advise_ai_only_many` | **仅评测用**（run_benchmark.py），生产路径不走 |
+| `probe` | 用一个无害样本验证连通性与结构化输出 |
+| `_fallback_advice` / `_apply_hybrid_guard` | AI 失败降级；AI 建议删除时的双重本地闸门 |
+| `_request_batch_resilient` | 坏样本二分拆批（已泛化，判定与介绍任务共用），避免整批报废 |
+| `_request_ai_batch` / `_request_describe_batch` | HTTP + 重试（429/5xx 指数退避）+ id 完整性校验 |
+| `summarize_overview` | **深度分析综述**：自由 Markdown，走 `cache.get_text/set_text`，失败返回 None（绝不影响判定） |
+| `build_advisor` | CLI/GUI 共用的构造工厂（读 .env → Settings → HybridAdvisor） |
 
 ### overview.py — 深度分析事实层
 `build_overview_payload` 是唯一入口：把快照库聚合成"整盘/整目录视图"（范围总量、直接子目录排名、
