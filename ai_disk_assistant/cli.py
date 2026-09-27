@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .admin import analysis_blockers
@@ -60,6 +61,9 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--output", help="CSV 输出路径")
     analyze_parser.add_argument("--summary-json", help="可选统计摘要 JSON 输出路径")
     analyze_parser.add_argument("--html", dest="html_output", help="可视化 HTML 报告路径")
+    analyze_parser.add_argument(
+        "--overview-md", help="AI 深度分析综述的 Markdown 输出路径（默认随报告落在 reports/）"
+    )
     analyze_parser.add_argument("--areas-json", help="可选区域与重复组 JSON 输出路径")
     return parser
 
@@ -80,6 +84,19 @@ def _print_candidate(index: int, item) -> None:
     if item.advice.evidence:
         print(f"判断依据：{'；'.join(item.advice.evidence)}")
     print(f"判断来源：{item.advice.source}")
+
+
+def _safe_print(text: str) -> None:
+    """打印 AI 自由文本：模型可能输出 ✓/→/emoji 等 GBK 控制台无法编码的字符。
+
+    中文 Windows 控制台默认 cp936，直接 print 会以 UnicodeEncodeError 结束整个分析流程——
+    这里退化为替换字符，保证"报告已经写完，只是终端少显示几个符号"。
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
 # ── 子命令实现 ───────────────────────────────────────────────────────────
@@ -127,6 +144,11 @@ def command_analyze(args: argparse.Namespace) -> int:
         _print_candidate(index, item)
     if len(result.candidates) > 30:
         print("\n终端仅展示前 30 个，完整结果请查看报告。")
+    if result.narrative:
+        print("\n" + "=" * 62)
+        print("AI 深度分析")
+        print("=" * 62)
+        _safe_print(result.narrative)
     if result.duplicates:
         total_wasted = sum(group.wasted_bytes for group in result.duplicates)
         print(
@@ -152,10 +174,14 @@ def command_analyze(args: argparse.Namespace) -> int:
         csv_path=args.output,
         summary_json_path=args.summary_json,
         html_path=args.html_output,
+        narrative=result.narrative,
+        overview_md_path=args.overview_md,
     )
     print(f"\nCSV 报告：{reports.csv}")
     print(f"统计摘要：{reports.summary}")
     print(f"HTML 可视化：{reports.html}")
+    if reports.overview is not None:
+        print(f"AI 深度分析：{reports.overview}")
     if args.areas_json:
         areas_path = Path(args.areas_json)
         areas_path.parent.mkdir(parents=True, exist_ok=True)

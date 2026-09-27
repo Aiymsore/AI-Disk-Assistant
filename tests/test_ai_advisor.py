@@ -6,10 +6,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_disk_assistant.ai_advisor import AdvisorError, HybridAdvisor, _validate_advice
+from ai_disk_assistant.ai_advisor import (
+    SYSTEM_PROMPT,
+    UNIT_SYSTEM_PROMPT,
+    AdvisorError,
+    HybridAdvisor,
+    _validate_advice,
+)
 from ai_disk_assistant.cache import AdviceCache
 from ai_disk_assistant.config import Settings
-from ai_disk_assistant.models import FileMetadata
+from ai_disk_assistant.models import ADVICE_LEVELS, PURPOSES, FileMetadata, Unit
+from ai_disk_assistant.privacy import unit_payload_for_ai
 
 
 class FakeResponse:
@@ -240,6 +247,25 @@ class AdvisorTests(unittest.TestCase):
         result = advisor.advise(metadata(r"C:\Users\Test\Documents\report.docx"))
         self.assertFalse(result.recommend_delete)
         self.assertEqual(result.source, "local-guard")
+
+
+class PromptEnumSyncTests(unittest.TestCase):
+    """维护守则：PURPOSES / ADVICE_LEVELS 变更必须同步结构化提示词的枚举清单。"""
+
+    def test_structured_prompts_list_all_enums(self) -> None:
+        for prompt in (SYSTEM_PROMPT, UNIT_SYSTEM_PROMPT):
+            for purpose in sorted(PURPOSES):
+                self.assertIn(purpose, prompt, f"{purpose!r} 缺失于提示词枚举清单")
+            for level in sorted(ADVICE_LEVELS):
+                self.assertIn(level, prompt, f"{level!r} 缺失于提示词枚举清单")
+
+    def test_unit_prompt_evidence_examples_use_real_payload_fields(self) -> None:
+        # 证据闸门按载荷字段名核对：提示词里的示例字段必须真实存在，否则示例本身就会降级。
+        unit = Unit("fp", r"C:\Temp", ".tmp", "小(≤1MB)", 3, 3000)
+        payload = unit_payload_for_ai(unit, "balanced")
+        for field in ("suffix", "file_count", "path_pattern"):
+            self.assertIn(f"{field}=", UNIT_SYSTEM_PROMPT)
+            self.assertIn(field, payload)
 
 
 if __name__ == "__main__":

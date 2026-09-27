@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -72,6 +73,7 @@ def build_summary(
     candidates: Iterable[Candidate],
     scan_stats: ScanStats | Mapping[str, Any] | None = None,
     advisor_stats: Mapping[str, Any] | None = None,
+    narrative: str | None = None,
 ) -> dict[str, Any]:
     items = list(candidates)
     total_size = sum(item.metadata.size_bytes for item in items)
@@ -123,6 +125,8 @@ def build_summary(
         ],
         "scan": dict(scan_data),
         "ai": dict(advisor_stats or {}),
+        # AI 深度分析综述（Markdown 原文）；未启用 AI 或生成失败时为空串。
+        "narrative": (narrative or "").strip(),
     }
 
 
@@ -135,12 +139,13 @@ def write_summary_json(summary: Mapping[str, Any], output: str | Path) -> Path:
 
 @dataclass(slots=True)
 class ReportPaths:
-    """一次扫描产出的各报告文件路径；detail_json 仅在显式要求时生成。"""
+    """一次扫描产出的各报告文件路径；detail_json / overview 仅在显式要求时生成。"""
 
     csv: Path
     summary: Path
     html: Path
     detail_json: Path | None = None
+    overview: Path | None = None
 
 
 def write_all_reports(
@@ -152,19 +157,96 @@ def write_all_reports(
     detail_json_path: str | Path | None = None,
     summary_json_path: str | Path | None = None,
     html_path: str | Path | None = None,
+    narrative: str | None = None,
+    overview_md_path: str | Path | None = None,
 ) -> ReportPaths:
-    """CLI 与 GUI 共用的报告流水线：CSV + 统计摘要 JSON + HTML 必写，明细 JSON 可选。
+    """CLI 与 GUI 共用的报告流水线：CSV + 统计摘要 JSON + HTML 必写，明细 JSON 与综述按需。
 
+    综述（narrative）非空时同时写入 HTML 报告与一份独立 Markdown；为空则完全不产生该产物。
     未显式给路径的报告落到 reports/ 目录下的默认时间戳文件名。
     """
     items = list(candidates)
-    summary = build_summary(items, scan_stats, advisor_stats)
+    summary = build_summary(items, scan_stats, advisor_stats, narrative)
     return ReportPaths(
         csv=write_csv(items, csv_path or default_report_path("csv")),
         detail_json=write_json(items, detail_json_path) if detail_json_path else None,
         summary=write_summary_json(summary, summary_json_path or default_report_path("summary.json")),
         html=write_html_report(summary, html_path or default_report_path("html")),
+        overview=(
+            write_overview_markdown(narrative, overview_md_path or default_report_path("analysis.md"))
+            if (narrative or "").strip()
+            else None
+        ),
     )
+
+
+# ── AI 综述渲染：极简 Markdown 子集 → HTML（零第三方依赖）─────────────────
+# 只支持综述提示词约定的语法：标题、有序/无序列表、加粗、行内代码。
+# 先 html.escape 再套标签，模型输出永远不能注入 HTML。
+def _inline_markdown(text: str) -> str:
+    escaped = html.escape(text)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def markdown_to_html(text: str) -> str:
+    """把 AI 综述转成 HTML 片段；未识别的行按段落处理，绝不原样透传标签。"""
+    blocks: list[str] = []
+    list_tag: str | None = None
+
+    def close_list() -> None:
+        nonlocal list_tag
+        if list_tag is not None:
+            blocks.append(f"</{list_tag}>")
+            list_tag = None
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            close_list()
+            continue
+        heading = re.match(r"^(#{1,4})\s+(.*)$", stripped)
+        if heading:
+            close_list()
+            level = min(len(heading.group(1)) + 1, 5)  # "# " → h2（h1 留给报告标题）
+            blocks.append(f"<h{level}>{_inline_markdown(heading.group(2))}</h{level}>")
+            continue
+        bullet = re.match(r"^[-*+]\s+(.*)$", stripped)
+        if bullet:
+            if list_tag != "ul":
+                close_list()
+                blocks.append("<ul>")
+                list_tag = "ul"
+            blocks.append(f"<li>{_inline_markdown(bullet.group(1))}</li>")
+            continue
+        numbered = re.match(r"^\d+[.)]\s+(.*)$", stripped)
+        if numbered:
+            if list_tag != "ol":
+                close_list()
+                blocks.append("<ol>")
+                list_tag = "ol"
+            blocks.append(f"<li>{_inline_markdown(numbered.group(1))}</li>")
+            continue
+        close_list()
+        blocks.append(f"<p>{_inline_markdown(stripped)}</p>")
+    close_list()
+    return "\n".join(blocks)
+
+
+def write_overview_markdown(narrative: str, output: str | Path) -> Path:
+    """把 AI 综述单独落一份 Markdown（便于贴进聊天/文档，也是"截图式分析"的成品）。"""
+    path = Path(output)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    body = (
+        "# P4Disk4P 深度分析报告\n\n"
+        f"> 生成时间：{stamp}　|　由 AI 依据本地扫描的聚合事实撰写，未读取任何文件内容。\n"
+        "> 本报告仅为分析建议，自动流程不会移动或删除任何文件。\n\n"
+        f"{narrative.strip()}\n"
+    )
+    path.write_text(body, encoding="utf-8")
+    return path.resolve()
 
 
 def _distribution_rows(distribution: Mapping[str, int]) -> str:
@@ -196,6 +278,16 @@ def write_html_report(summary: Mapping[str, Any], output: str | Path) -> Path:
     )
     scan = summary.get("scan", {})
     ai = summary.get("ai", {})
+    narrative = str(summary.get("narrative", "") or "").strip()
+    narrative_section = (
+        "<section class='panel narrative' style='margin-top:16px'>"
+        "<h2>AI 深度分析</h2>"
+        "<p class='muted'>由 AI 依据本地扫描的聚合事实撰写，未读取任何文件内容；"
+        "以下内容仅为分析建议，自动流程不会移动或删除任何文件。</p>"
+        f"{markdown_to_html(narrative)}</section>"
+        if narrative
+        else ""
+    )
     document = f"""<!doctype html>
 <html lang='zh-CN'>
 <head>
@@ -214,6 +306,10 @@ h1{{margin-bottom:6px}} .muted{{color:#6b7280}}
 .bar-track{{height:11px;background:#e5e7eb;border-radius:9px;overflow:hidden}} .bar{{height:100%;background:#4f46e5;border-radius:9px}}
 table{{width:100%;border-collapse:collapse}} th,td{{text-align:left;padding:10px;border-bottom:1px solid #eef0f4;font-size:14px}} th{{color:#4b5563}}
 code{{background:#eef2ff;padding:2px 6px;border-radius:5px}}
+.narrative h2{{font-size:19px;margin:18px 0 8px}} .narrative h3{{font-size:16px;margin:14px 0 6px}}
+.narrative h4,.narrative h5{{font-size:15px;margin:12px 0 6px}}
+.narrative p{{margin:8px 0;line-height:1.75}} .narrative li{{margin:4px 0;line-height:1.7}}
+.narrative ul,.narrative ol{{margin:8px 0 8px 22px;padding:0}}
 </style>
 </head>
 <body><main>
@@ -225,6 +321,7 @@ code{{background:#eef2ff;padding:2px 6px;border-radius:5px}}
 <div class='card'><div class='muted'>明确建议删除</div><div class='value'>{summary.get('recommended_count', 0)}</div></div>
 <div class='card'><div class='muted'>预计可释放</div><div class='value'>{html.escape(str(summary.get('recommended_size_text', '0 B')))}</div></div>
 </section>
+{narrative_section}
 <section class='grid'>
 <div class='panel'><h2>建议等级</h2>{_distribution_rows(summary.get('advice_level_distribution', {}))}</div>
 <div class='panel'><h2>判断来源</h2>{_distribution_rows(summary.get('advice_source_distribution', {}))}</div>

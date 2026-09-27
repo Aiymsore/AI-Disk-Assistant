@@ -4,6 +4,8 @@
 - 文件表存"事实"（路径/大小/mtime），目录表存递归聚合（总大小/文件数/主要后缀），
   AI 判读与下钻查询都从这里取数，保证同一次分析内所有阶段看到同一份事实。
 - mtime 仅入库备查，不参与任何判定（Windows 下不可靠，见 scanner.py 的说明）。
+- 手动删除（cleaner.py）落盘后由调用方回删快照行（remove_files / remove_dir_subtree）
+  并重跑 refresh_dir_aggregates，保证快照聚合与磁盘盘面一致。
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ from typing import Iterable
 
 _BATCH_SIZE = 2000
 _KEEP_SNAPSHOTS = 3  # 快照库只保留最近 N 次扫描：快照可随时重扫，历史没有保留价值
+# IN (...) 条目的分块大小：兼顾老版 SQLite 的绑定变量数上限与点查效率。
+_QUERY_CHUNK = 500
 
 
 @dataclass(slots=True)
@@ -157,6 +161,17 @@ class Inventory:
         separator = "\\" if "\\" in directory else "/"
         return directory + separator
 
+    def subtree_usage(self, snapshot_id: int, directory: str) -> tuple[int, int]:
+        """某个目录子树的总字节与文件数（SQL 聚合，不物化文件行）——深度分析的规模基线。"""
+        prefix = self._subtree_prefix(directory)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT IFNULL(SUM(size_bytes), 0), COUNT(*) FROM files "
+                "WHERE snapshot_id = ? AND substr(path, 1, ?) = ?",
+                (snapshot_id, len(prefix), prefix),
+            ).fetchone()
+        return int(row[0]), int(row[1])
+
     def extension_stats(self, snapshot_id: int, directory: str, limit: int = 50) -> list[dict[str, object]]:
         """某个目录子树内按后缀聚合（大小降序）——扩展名分类面板用。"""
         prefix = self._subtree_prefix(directory)
@@ -271,13 +286,27 @@ class Inventory:
             pass
         return stale
 
-    def top_dirs(self, snapshot_id: int, limit: int, *, exclude: str | None = None) -> list[DirAgg]:
-        """按递归总大小降序返回目录聚合；exclude 用于剔除根目录自身。"""
+    def top_dirs(
+        self,
+        snapshot_id: int,
+        limit: int,
+        *,
+        exclude: str | None = None,
+        under: str | None = None,
+    ) -> list[DirAgg]:
+        """按递归总大小降序返回目录聚合。
+
+        exclude 用于剔除根目录自身；under 只保留该目录子树内的目录（深度分析按范围取数）。
+        """
         query = "SELECT path, parent, total_size, file_count, top_suffixes, mtime_ns FROM dirs WHERE snapshot_id = ?"
         params: list[object] = [snapshot_id]
         if exclude:
             query += " AND path != ?"
             params.append(exclude)
+        if under:
+            prefix = self._subtree_prefix(under)
+            query += " AND substr(path, 1, ?) = ?"
+            params.extend([len(prefix), prefix])
         query += " ORDER BY total_size DESC LIMIT ?"
         params.append(limit)
         with closing(self._connect()) as connection:
@@ -294,14 +323,21 @@ class Inventory:
             for row in rows
         ]
 
-    def child_dirs(self, snapshot_id: int, parent: str) -> list[DirAgg]:
-        """某个目录的直接子目录（dirs 表存的是递归聚合值，直接可用作下钻摘要）。"""
+    def child_dirs(self, snapshot_id: int, parent: str, limit: int | None = None) -> list[DirAgg]:
+        """某个目录的直接子目录（dirs 表存的是递归聚合值，直接可用作下钻摘要）。
+
+        limit 用于只取体积最大的前 N 个（深度分析取数用）；默认不限制（下钻需要完整清单）。
+        """
+        query = (
+            "SELECT path, parent, total_size, file_count, top_suffixes, mtime_ns FROM dirs "
+            "WHERE snapshot_id = ? AND parent = ? ORDER BY total_size DESC"
+        )
+        params: list[object] = [snapshot_id, parent]
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
         with closing(self._connect()) as connection:
-            rows = connection.execute(
-                "SELECT path, parent, total_size, file_count, top_suffixes, mtime_ns FROM dirs "
-                "WHERE snapshot_id = ? AND parent = ? ORDER BY total_size DESC",
-                (snapshot_id, parent),
-            ).fetchall()
+            rows = connection.execute(query, params).fetchall()
         return [
             DirAgg(
                 path=row[0],
@@ -313,6 +349,22 @@ class Inventory:
             )
             for row in rows
         ]
+
+    def largest_files(
+        self, snapshot_id: int, limit: int, *, under: str | None = None
+    ) -> list[FileRow]:
+        """体积最大的文件（可选限定在某个子树内）——深度分析的"最占地方的文件"清单。"""
+        query = (
+            "SELECT path, name, suffix, size_bytes, mtime_ns FROM files WHERE snapshot_id = ?"
+        )
+        params: list[object] = [snapshot_id]
+        if under:
+            prefix = self._subtree_prefix(under)
+            query += " AND substr(path, 1, ?) = ?"
+            params.extend([len(prefix), prefix])
+        query += " ORDER BY size_bytes DESC LIMIT ?"
+        params.append(limit)
+        return self._file_rows(query, tuple(params))
 
     def direct_files(self, snapshot_id: int, parent: str) -> list[FileRow]:
         """某个目录下的直接文件（不含子目录内容）——递归下钻时覆盖散文件用。"""
@@ -330,6 +382,68 @@ class Inventory:
             "WHERE snapshot_id = ? AND substr(path, 1, ?) = ?",
             (snapshot_id, len(prefix), prefix),
         )
+
+    def classify_paths(self, snapshot_id: int, paths: Iterable[str]) -> tuple[set[str], set[str]]:
+        """把一批路径按快照库归类为 (目录, 文件)；两边都不在的路径不会出现在结果里。"""
+        unique = list(dict.fromkeys(paths))
+        dirs: set[str] = set()
+        files: set[str] = set()
+        for start in range(0, len(unique), _QUERY_CHUNK):
+            chunk = unique[start : start + _QUERY_CHUNK]
+            dirs |= self._existing_paths(snapshot_id, chunk, "dirs")
+            files |= self._existing_paths(snapshot_id, chunk, "files")
+        return dirs, files
+
+    def _existing_paths(self, snapshot_id: int, chunk: list[str], table: str) -> set[str]:
+        """单表精确路径存在性查询（table 只由 classify_paths 传入字面量 dirs/files）。"""
+        placeholders = ",".join("?" * len(chunk))
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"SELECT path FROM {table} WHERE snapshot_id = ? AND path IN ({placeholders})",
+                [snapshot_id, *chunk],
+            ).fetchall()
+        return {row[0] for row in rows}
+
+    def file_rows_by_paths(self, snapshot_id: int, paths: Iterable[str]) -> list[FileRow]:
+        """按精确路径批量取文件行（手动删除计划展开用）。"""
+        unique = list(dict.fromkeys(paths))
+        rows: list[FileRow] = []
+        for start in range(0, len(unique), _QUERY_CHUNK):
+            chunk = unique[start : start + _QUERY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows.extend(
+                self._file_rows(
+                    "SELECT path, name, suffix, size_bytes, mtime_ns FROM files "
+                    f"WHERE snapshot_id = ? AND path IN ({placeholders})",
+                    tuple([snapshot_id, *chunk]),
+                )
+            )
+        return rows
+
+    def remove_files(self, snapshot_id: int, paths: Iterable[str]) -> int:
+        """按精确路径删除文件行（手动删除落盘后同步快照），返回删除的行数。"""
+        unique = list(dict.fromkeys(paths))
+        removed = 0
+        with self._lock, closing(self._connect()) as connection, connection:
+            for start in range(0, len(unique), _QUERY_CHUNK):
+                chunk = unique[start : start + _QUERY_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                cursor = connection.execute(
+                    f"DELETE FROM files WHERE snapshot_id = ? AND path IN ({placeholders})",
+                    [snapshot_id, *chunk],
+                )
+                removed += max(cursor.rowcount, 0)
+        return removed
+
+    def remove_dir_subtree(self, snapshot_id: int, directory: str) -> int:
+        """删除目录行及其全部子孙目录行（文件行由调用方按磁盘事实另行回删）。"""
+        prefix = self._subtree_prefix(directory)
+        with self._lock, closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "DELETE FROM dirs WHERE snapshot_id = ? AND (path = ? OR substr(path, 1, ?) = ?)",
+                (snapshot_id, directory, len(prefix), prefix),
+            )
+        return max(cursor.rowcount, 0)
 
     def _file_rows(self, query: str, params: tuple) -> list[FileRow]:
         with closing(self._connect()) as connection:

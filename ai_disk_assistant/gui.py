@@ -1,11 +1,12 @@
-"""图形界面层（Tkinter）：WizTree 式磁盘浏览器 + 勾选送 AI 评审。
+"""图形界面层（Tkinter）：WizTree 式磁盘浏览器 + 选中送 AI 评审 + 勾选手动删除。
 
-布局：顶栏（选卷/扫描/管理员重启 + 权限）→ 空间头（总/已用/可用/耗时）→
-主区（左侧当前目录列表：目录在前、大小降序、双击下钻；右侧扩展名分类面板）→
-底部（勾选送 AI 评审 + 变色候选列表与判断依据）。不做全量树与 treemap：
-浏览式下钻一次只查一层（SQLite 毫秒级），评审目标由用户勾选决定。
+布局：顶栏（选卷/扫描/暂停取消/删除勾选 + AI 工具 + 权限）→ 空间头（总/已用/可用/耗时）→
+主区（左侧当前目录列表：行首方框标记删除、目录在前、大小降序、双击下钻；右侧扩展名分类面板）→
+底部（选中送 AI 评审 + 变色候选列表与判断依据）。不做全量树与 treemap：
+浏览式下钻一次只查一层（SQLite 毫秒级），评审目标由用户选中决定。
 扫描支持暂停/继续/取消与百分比进度（ScanControl）。
-本工具只产出建议与报告，不做任何删除动作。
+自动流程（扫描/评审/报告/综述）不做任何删除动作；唯一删除入口是行首方框勾选 +
+「删除勾选」按钮二次确认，由 cleaner.py 执行（移入回收站，受保护目录拒绝）。
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from tkinter import (
     BooleanVar,
     PhotoImage,
     StringVar,
+    Text,
     TclError,
     Tk,
     Toplevel,
@@ -38,6 +40,7 @@ from tkinter import (
 from . import __version__
 from .admin import analysis_blockers, is_user_admin, relaunch_as_admin
 from .ai_advisor import build_advisor
+from .cleaner import DeletionPlan, plan_deletion, prune_empty_dirs, recycle_paths
 from .config import (
     DEFAULT_CACHE_PATH,
     DEFAULT_INVENTORY_PATH,
@@ -52,7 +55,8 @@ from .inventory import FileRow, Inventory
 from .metadata import format_mtime, format_pct, format_size
 from .mft_scanner import MftError, ScanCancelled, ScanControl, snapshot_volume, volume_capacity
 from .models import Candidate, FileMetadata, ScanStats
-from .report import write_all_reports
+from .overview import build_overview_payload
+from .report import default_report_path, write_all_reports, write_overview_markdown
 from .scanner import ScanPolicy, _signals_from_facts, judge_metadata_records
 
 def _review_stats(scored: int, kept: int, unit_count: int) -> "ScanStats":
@@ -73,9 +77,17 @@ LEVEL_COLORS = {
     "不建议删除": "#1e8449",
 }
 
+# "建议清理"层级：AI 明确倾向清理的两档。底部候选列表默认只显示这两档，
+# 人工确认/不建议删除通过"只看建议清理"开关随时展开（数据不丢，只是折叠显示）。
+_CLEANUP_LEVELS = {"建议删除", "谨慎删除"}
+
 _DIR_TAG = "dir"
 _FILE_TAG = "file"
 _STRIPE_TAG = "stripe"
+
+# 行首删除勾选方框（Treeview 无原生复选框，用字符形绘制，点击行首列切换）。
+_CHECK_ON = "☑"
+_CHECK_OFF = "□"
 
 # ── 视觉设计系统（纯 ttk 实现，零第三方依赖）──────────────────────────────
 # 白底工作区 + 浅灰面板 + 蓝色主操作色；等级色沿用 LEVEL_COLORS。
@@ -89,6 +101,8 @@ COLOR_ACCENT_HOVER = "#1d4ed8"
 COLOR_ACCENT_SOFT = "#dbeafe"  # 选中行底色
 COLOR_STRIPE = "#f7f8fa"  # 表格斑马纹
 COLOR_DIR_ROW = "#eef3fb"  # 目录行底色
+COLOR_DANGER = "#c0392b"  # 删除操作（与"建议删除"等级色一致）
+COLOR_DANGER_HOVER = "#a93226"
 APP_NAME = "P4Disk4P"
 FONT_FAMILY = "Microsoft YaHei UI"
 
@@ -168,6 +182,19 @@ def _setup_style(root: Tk) -> None:
         "Primary.TButton",
         background=[("disabled", "#93b4f5"), ("pressed", COLOR_ACCENT_HOVER), ("active", COLOR_ACCENT_HOVER)],
         foreground=[("disabled", "#eef2ff")],
+    )
+    style.configure(
+        "Danger.TButton",
+        background=COLOR_DANGER,
+        foreground="#ffffff",
+        bordercolor=COLOR_DANGER,
+        lightcolor=COLOR_DANGER,
+        darkcolor=COLOR_DANGER,
+    )
+    style.map(
+        "Danger.TButton",
+        background=[("disabled", "#e5a79d"), ("pressed", COLOR_DANGER_HOVER), ("active", COLOR_DANGER_HOVER)],
+        foreground=[("disabled", "#fdf3f1")],
     )
 
     style.configure(
@@ -425,6 +452,9 @@ class DiskAssistantGUI:
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.last_html: Path | None = None
         self.reviewed_candidates: list[Candidate] = []
+        self._busy = False
+        # 行首方框的删除标记（按路径），跨目录导航保留；重新扫描后清空。
+        self._delete_marks: set[str] = set()
 
         self.inventory = Inventory(DEFAULT_INVENTORY_PATH)
         self.snapshot_id: int | None = None
@@ -442,6 +472,7 @@ class DiskAssistantGUI:
 
         self._build()
         self._update_capacity()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll_events)
 
     # ── 布局 ─────────────────────────────────────────────────────────────
@@ -476,6 +507,11 @@ class DiskAssistantGUI:
             top, text="取消", command=self._cancel_scan, state="disabled", width=6
         )
         self.cancel_button.pack(side=LEFT, padx=(px(6), 0))
+        # 手动删除：与扫描/暂停同一行；只有行首方框勾选后可用，点击后二次确认。
+        self.delete_button = ttk.Button(
+            top, text="删除勾选", style="Danger.TButton", command=self._delete_checked, state="disabled"
+        )
+        self.delete_button.pack(side=LEFT, padx=(px(12), 0))
         self.admin_button = ttk.Button(top, text="以管理员重启", command=self._restart_as_admin)
         self.admin_button.pack(side=RIGHT)
         self.ai_config_button = ttk.Button(top, text="AI 配置", command=self._open_ai_config)
@@ -501,17 +537,27 @@ class DiskAssistantGUI:
         main = ttk.PanedWindow(self.root, orient=HORIZONTAL)
         main.pack(fill=BOTH, expand=True, padx=px(14), pady=(px(4), 0))
 
-        # 左：当前目录列表（目录在前、大小降序，双击进入；多选后送评审）
+        # 左：当前目录列表（行首方框标记删除；目录在前、大小降序，双击进入；多选后送评审）
         list_frame = ttk.Frame(main, style="Card.TFrame", padding=1)
-        list_columns = ("name", "pct", "size", "items", "mtime")
+        list_columns = ("check", "name", "pct", "size", "items", "mtime")
         self.list_tree = ttk.Treeview(
             list_frame, columns=list_columns, show="headings", selectmode="extended"
         )
-        list_headings = {"name": "名称", "pct": "父级百分比", "size": "大小", "items": "项数", "mtime": "修改时间"}
-        list_widths = {"name": 320, "pct": 90, "size": 100, "items": 80, "mtime": 150}
+        list_headings = {
+            "check": "全选",
+            "name": "名称",
+            "pct": "父级百分比",
+            "size": "大小",
+            "items": "项数",
+            "mtime": "修改时间",
+        }
+        list_widths = {"check": 48, "name": 320, "pct": 90, "size": 100, "items": 80, "mtime": 150}
         for column in list_columns:
             self.list_tree.heading(column, text=list_headings[column])
             self.list_tree.column(column, width=px(list_widths[column]), minwidth=px(60))
+        # 勾选列：居中、不随窗口拉伸；点击表头对当前列表全选/反选。
+        self.list_tree.column("check", minwidth=px(40), anchor="center", stretch=False)
+        self.list_tree.heading("check", command=self._toggle_all_marks)
         self.list_tree.tag_configure(_DIR_TAG, background=COLOR_DIR_ROW)
         self.list_tree.tag_configure(_STRIPE_TAG, background=COLOR_STRIPE)
         for level, color in LEVEL_COLORS.items():
@@ -520,6 +566,7 @@ class DiskAssistantGUI:
         self.list_tree.configure(yscrollcommand=list_scroll.set)
         self.list_tree.pack(side=LEFT, fill=BOTH, expand=True)
         list_scroll.pack(side=RIGHT, fill="y")
+        self.list_tree.bind("<Button-1>", self._on_list_click)
         self.list_tree.bind("<Double-1>", self._on_double_click)
         main.add(list_frame, weight=3)
 
@@ -541,13 +588,29 @@ class DiskAssistantGUI:
         ext_scroll.pack(side=RIGHT, fill="y")
         main.add(ext_frame, weight=1)
 
-        # 底部：勾选送 AI 评审 + 变色候选列表
+        # 底部：选中送 AI 评审 + 变色候选列表（与行首删除方框互不相干）
         review_bar = ttk.Frame(self.root, padding=(px(14), px(6), px(14), 0))
         review_bar.pack(fill="x")
         ttk.Label(
             review_bar,
-            text="在列表中勾选目录/文件后送 AI 评审（评审过的文件获得删除建议与依据）：",
+            text="在列表中选中（高亮）目录/文件后送 AI 评审（行首方框是手动删除标记，与评审无关）：",
         ).pack(side=LEFT)
+        # 折叠开关：默认只显示"建议删除/谨慎删除"，人工确认等大量不确定项不刷屏。
+        self.only_cleanup_var = BooleanVar(value=True)
+        ttk.Checkbutton(
+            review_bar,
+            text="只看建议清理",
+            variable=self.only_cleanup_var,
+            command=self._apply_review_filter,
+        ).pack(side=LEFT, padx=(px(12), 0))
+        self.review_count_label = ttk.Label(review_bar, text="", style="Muted.TLabel")
+        self.review_count_label.pack(side=LEFT, padx=(px(10), 0))
+        self.overview_button = ttk.Button(
+            review_bar,
+            text="AI 深度分析（当前目录）",
+            command=self._start_overview,
+        )
+        self.overview_button.pack(side=RIGHT, padx=(0, px(8)))
         self.review_button = ttk.Button(
             review_bar, text="评审所选 → AI", style="Primary.TButton", command=self._review_selected
         )
@@ -611,7 +674,20 @@ class DiskAssistantGUI:
         if not relaunch_as_admin(gui_entry):
             messagebox.showerror("重启失败", "UAC 提权被取消或失败，未启动新进程。")
             return
-        self.root.after(300, self.root.destroy)
+        self.root.after(300, self._on_close)
+
+    def _on_close(self) -> None:
+        """关窗/提权重启的统一出口：先取消扫描，再立即终止进程。
+
+        PyInstaller 单文件版退出时由引导器删除解包目录（%TEMP%\\_MEI…）；若解释器
+        收尾时后台线程仍卡在扫描循环/AI 请求重试里，句柄未释放，引导器删不掉目录，
+        会弹 "Failed to remove temporary directory" 警告框。这里先取消扫描再用
+        os._exit 终止：全部句柄随进程终止一起释放，临时目录必能清掉。
+        """
+        if self.scan_control is not None:
+            self.scan_control.cancel()
+        self.root.destroy()
+        os._exit(0)
 
     def _open_ai_config(self) -> None:
         AIConfigDialog(self.root, self._after_ai_config_saved)
@@ -735,8 +811,9 @@ class DiskAssistantGUI:
 
         for index, (name, pct, size, items, mtime, path, tag, _sort_key) in enumerate(rows):
             tags = (tag, _STRIPE_TAG) if index % 2 else (tag,)
+            check = _CHECK_ON if path in self._delete_marks else _CHECK_OFF
             self.list_tree.insert(
-                "", END, iid=path, tags=tags, values=(name, pct, size, items, mtime, path)
+                "", END, iid=path, tags=tags, values=(check, name, pct, size, items, mtime)
             )
 
         self.ext_tree.delete(*self.ext_tree.get_children())
@@ -748,9 +825,11 @@ class DiskAssistantGUI:
                 tags=tags,
                 values=(stats["suffix"], format_size(int(stats["size_bytes"])), stats["file_count"]),
             )
-        self.status_var.set(status_extra + f"（共 {len(rows)} 项，勾选后可送 AI 评审）")
+        self.status_var.set(status_extra + f"（共 {len(rows)} 项，选中后可送 AI 评审）")
 
     def _on_double_click(self, event) -> None:
+        if self.list_tree.identify_column(event.x) == "#1":
+            return  # 行首方框列：双击只切换勾选，不触发下钻/打开
         item = self.list_tree.identify_row(event.y)
         if not item:
             return
@@ -761,6 +840,118 @@ class DiskAssistantGUI:
             self._enter_dir(item, children_total)
         else:
             _open_in_explorer(Path(item))
+
+    # ── 手动删除（行首方框勾选 → 二次确认 → 回收站）─────────────────────
+    def _on_list_click(self, event) -> None:
+        """点击行首方框列切换删除标记；其余列保持 Treeview 原生选择行为。"""
+        if self.list_tree.identify_region(event.x, event.y) != "cell":
+            return
+        if self.list_tree.identify_column(event.x) != "#1":
+            return
+        item = self.list_tree.identify_row(event.y)
+        if item:
+            self._toggle_mark(item)
+
+    def _toggle_mark(self, item: str) -> None:
+        if item in self._delete_marks:
+            self._delete_marks.discard(item)
+            self.list_tree.set(item, "check", _CHECK_OFF)
+        else:
+            self._delete_marks.add(item)
+            self.list_tree.set(item, "check", _CHECK_ON)
+        self._refresh_delete_state()
+
+    def _toggle_all_marks(self) -> None:
+        """点击"全选"表头：当前列表已全勾选则清空，否则全部勾上。"""
+        children = self.list_tree.get_children()
+        if not children:
+            return
+        if all(item in self._delete_marks for item in children):
+            for item in children:
+                self._delete_marks.discard(item)
+                self.list_tree.set(item, "check", _CHECK_OFF)
+        else:
+            for item in children:
+                self._delete_marks.add(item)
+                self.list_tree.set(item, "check", _CHECK_ON)
+        self._refresh_delete_state()
+
+    def _refresh_delete_state(self) -> None:
+        """删除按钮仅在"非忙且有勾选"时可用，并实时显示勾选数量。"""
+        count = len(self._delete_marks)
+        state = "normal" if count and not self._busy else "disabled"
+        self.delete_button.configure(state=state, text=f"删除勾选（{count}）" if count else "删除勾选")
+
+    def _delete_checked(self) -> None:
+        if self.snapshot_id is None:
+            messagebox.showinfo("尚未扫描", "请先完成一次扫描，再勾选删除目标。")
+            return
+        if not self._delete_marks:
+            messagebox.showinfo("未勾选", "请先在列表行首的方框中勾选要删除的文件或目录。")
+            return
+
+        plan = plan_deletion(self.inventory, self.snapshot_id, self._delete_marks)
+        if not plan.targets:
+            detail = "\n".join(f"· {path}：{reason}" for path, reason in plan.refused[:10])
+            messagebox.showwarning("没有可删除的目标", f"勾选的目标均不可删除：\n{detail}")
+            return
+
+        lines = [
+            f"即将删除 {len(plan.targets)} 个文件，共 {format_size(plan.total_bytes)}"
+            f"（来自 {len(plan.accepted_dir_marks)} 个勾选目录、{len(plan.accepted_file_marks)} 个勾选文件）。",
+            "文件将移入系统回收站，可在回收站中还原。",
+        ]
+        if plan.refused:
+            lines.append(f"另有 {len(plan.refused)} 个勾选目标被拒绝（受保护目录或快照中不存在）。")
+        if len(plan.targets) > 5000:
+            lines.append("勾选目标较多，删除可能耗时较长。")
+        lines += ["", "示例："]
+        lines += [f"· {row.path}" for row in plan.targets[:8]]
+        if len(plan.targets) > 8:
+            lines.append(f"…… 以及另外 {len(plan.targets) - 8} 项")
+        if not messagebox.askyesno("确认删除", "\n".join(lines)):
+            return
+
+        self._set_busy(True)
+        self.status_var.set(f"正在删除 {len(plan.targets)} 个文件（移入回收站）……")
+        threading.Thread(
+            target=self._delete_worker, args=(plan, self.snapshot_id), daemon=True
+        ).start()
+
+    def _delete_worker(self, plan: DeletionPlan, snapshot_id: int) -> None:
+        """后台线程：回收站执行 → 按磁盘事实回删快照行 → 重算目录聚合。"""
+        started = time.perf_counter()
+        try:
+            deleted, failed = recycle_paths([row.path for row in plan.targets])
+            deleted_set = set(deleted)
+            freed = sum(row.size_bytes for row in plan.targets if row.path in deleted_set)
+            if deleted_set:
+                self.inventory.remove_files(snapshot_id, deleted_set)
+            # 目录勾选：整体已消失 → 连同目录行回删；仍存在（部分删除）→ 清掉空目录壳。
+            for directory in plan.accepted_dir_marks:
+                if not os.path.exists(directory):
+                    self.inventory.remove_dir_subtree(snapshot_id, directory)
+                else:
+                    for removed_dir in prune_empty_dirs(directory):
+                        self.inventory.remove_dir_subtree(snapshot_id, removed_dir)
+            self.inventory.refresh_dir_aggregates(snapshot_id)
+            elapsed = time.perf_counter() - started
+            self.events.put(("delete_done", (deleted, failed, plan.refused, freed, elapsed)))
+        except Exception as exc:
+            self.events.put(("delete_error", f"{type(exc).__name__}: {exc}"))
+
+    def _refresh_current_view(self) -> None:
+        """删除后刷新当前目录（聚合已重算）；目录自身消失时回退到最近的现存祖先。"""
+        if self.snapshot_id is None or not self.current_dir:
+            return
+        target = self.current_dir
+        while len(target) > 3 and not Path(target).exists():
+            target = str(Path(target.rstrip("\\")).parent)
+        self.current_dir = target
+        if target.endswith(":\\"):
+            self._enter_dir(target, max(self.used_bytes, 1))
+        else:
+            self._enter_dir(target, self._child_total_from_inventory(target))
 
     def _child_total_from_inventory(self, directory: str) -> int:
         rows = self.inventory.child_dirs(self.snapshot_id or 0, str(Path(directory).parent))
@@ -801,7 +992,9 @@ class DiskAssistantGUI:
 
         selection = self.list_tree.selection()
         if not selection:
-            messagebox.showinfo("未选择", "请先在列表中勾选要评审的目录或文件（Ctrl/Shift 可多选）。")
+            messagebox.showinfo(
+                "未选择", "请先在列表中选中（高亮）要评审的目录或文件（Ctrl/Shift 可多选）。"
+            )
             return
 
         rows: list[FileRow] = []
@@ -864,6 +1057,104 @@ class DiskAssistantGUI:
         except Exception as exc:
             self.events.put(("review_error", str(exc)))
 
+    # ── AI 深度分析：自由综述（等价于"把磁盘占用截图发给 AI"）──────────────
+    def _start_overview(self) -> None:
+        if self.snapshot_id is None:
+            messagebox.showinfo("尚未扫描", "请先完成一次扫描，再对当前目录做深度分析。")
+            return
+        advisor = build_advisor()
+        blockers = [b for b in analysis_blockers(advisor.ai_available) if "管理员" not in b]
+        if blockers:
+            messagebox.showerror(
+                "无法深度分析",
+                "AI 未配置：请点击\"AI 配置\"填写密钥与模型。\n" + "\n".join(blockers),
+            )
+            return
+        scope = self.current_dir or self.volume_var.get()
+        self._set_busy(True)
+        self.status_var.set(f"正在做 AI 深度分析：{scope}（聚合并发送快照事实）……")
+        threading.Thread(
+            target=self._overview_worker,
+            args=(scope, advisor),
+            daemon=True,
+        ).start()
+
+    def _overview_worker(self, scope: str, advisor) -> None:
+        """后台线程：快照事实聚合 → 综述请求。全程只读快照库，不触碰文件系统。"""
+        started = time.perf_counter()
+        try:
+            payload = build_overview_payload(
+                self.inventory,
+                self.snapshot_id or 0,
+                scope,
+                privacy_mode=advisor.settings.ai_privacy_mode,
+            )
+            narrative = advisor.summarize_overview(payload)
+            if not narrative:
+                self.events.put(("overview_error", "AI 未返回分析正文（接口错误、超时或输出为空）。"))
+                return
+            path = write_overview_markdown(narrative, default_report_path("analysis.md"))
+            self.events.put(
+                (
+                    "overview_done",
+                    (scope, narrative, path, time.perf_counter() - started, advisor.stats),
+                )
+            )
+        except Exception as exc:
+            self.events.put(("overview_error", f"{type(exc).__name__}: {exc}"))
+
+    def _show_overview(self, scope: str, narrative: str, path: Path, elapsed: float, stats) -> None:
+        """综述阅读窗口：长文本按标题分层显示，支持复制与打开落盘的 Markdown。"""
+        window = Toplevel(self.root)
+        window.title(f"{APP_NAME} · AI 深度分析")
+        window.geometry(f"{round(920 * self._dpi_scale)}x{round(720 * self._dpi_scale)}")
+
+        header = ttk.Frame(window, padding=(12, 10, 12, 6))
+        header.pack(fill="x")
+        ttk.Label(header, text=f"分析范围：{scope}", style="Header.TLabel").pack(side=LEFT)
+        ttk.Label(
+            header,
+            text=f"耗时 {elapsed:.1f}s │ AI 请求 {stats.api_calls} 次 │ 缓存命中 {stats.cache_hits} 项",
+            style="Muted.TLabel",
+        ).pack(side=RIGHT)
+
+        body = ttk.Frame(window, padding=(12, 0, 12, 0))
+        body.pack(fill=BOTH, expand=True)
+        text_widget = Text(body, wrap="word", relief="flat", padx=10, pady=8)
+        scroll = ttk.Scrollbar(body, orient=VERTICAL, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scroll.set)
+        text_widget.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll.pack(side=RIGHT, fill="y")
+        body_font = (FONT_FAMILY, 10)
+        text_widget.configure(font=body_font, background=COLOR_SURFACE, foreground=COLOR_INK)
+        text_widget.tag_configure("heading", font=(FONT_FAMILY, 13, "bold"), spacing1=14, spacing3=6)
+        text_widget.tag_configure("body", font=body_font, spacing1=2, spacing3=4)
+        for line in narrative.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                text_widget.insert(END, stripped.lstrip("#").strip() + "\n", "heading")
+            else:
+                text_widget.insert(END, line + "\n", "body")
+        text_widget.configure(state="disabled")
+
+        footer = ttk.Frame(window, padding=(12, 8, 12, 12))
+        footer.pack(fill="x")
+
+        def copy_all() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(narrative)
+            self.status_var.set("AI 深度分析正文已复制到剪贴板。")
+
+        ttk.Button(footer, text="复制全文", command=copy_all).pack(side=LEFT)
+        ttk.Button(footer, text="打开 Markdown 文件", command=lambda: _open_path(path)).pack(
+            side=LEFT, padx=(6, 0)
+        )
+        ttk.Label(
+            footer,
+            text=f"已保存：{path}　|　分析仅供参考，自动流程不会移动或删除任何文件。",
+            style="Muted.TLabel",
+        ).pack(side=RIGHT)
+
     # ── 通用 ─────────────────────────────────────────────────────────────
     def _load_logo(self, size: int) -> PhotoImage | None:
         """加载 assets 下与 DPI 最匹配的 logo（size 为逻辑像素）；资源缺失时静默降级。"""
@@ -884,23 +1175,7 @@ class DiskAssistantGUI:
 
     def _fill_review_rows(self, candidates: list[Candidate]) -> None:
         self.reviewed_candidates = list(candidates)
-        for index, candidate in enumerate(candidates):
-            advice = candidate.advice
-            tags = (advice.advice_level, _STRIPE_TAG) if index % 2 else (advice.advice_level,)
-            self.review_tree.insert(
-                "",
-                END,
-                tags=tags,
-                values=(
-                    candidate.metadata.size_text,
-                    advice.advice_level,
-                    advice.purpose,
-                    advice.source,
-                    advice.reason,
-                    "；".join(advice.evidence),
-                    candidate.metadata.path,
-                ),
-            )
+        self._apply_review_filter()
         # 列表内已评审的文件行同步着色（可见即所得）。
         by_path = {candidate.metadata.path: candidate for candidate in candidates}
         for item in self.list_tree.get_children():
@@ -908,13 +1183,53 @@ class DiskAssistantGUI:
             if candidate is not None:
                 self.list_tree.item(item, tags=(f"reviewed:{candidate.advice.advice_level}",))
 
+    def _apply_review_filter(self) -> None:
+        """按"只看建议清理"开关重渲染候选列表：数据完整保留，只控制显示范围。"""
+        self.review_tree.delete(*self.review_tree.get_children())
+        only_cleanup = self.only_cleanup_var.get()
+        shown = 0
+        hidden_uncertain = 0
+        for candidate in self.reviewed_candidates:
+            level = candidate.advice.advice_level
+            if only_cleanup and level not in _CLEANUP_LEVELS:
+                if level == "人工确认":
+                    hidden_uncertain += 1
+                continue
+            tags = (level, _STRIPE_TAG) if shown % 2 else (level,)
+            self.review_tree.insert(
+                "",
+                END,
+                tags=tags,
+                values=(
+                    candidate.metadata.size_text,
+                    level,
+                    candidate.advice.purpose,
+                    candidate.advice.source,
+                    candidate.advice.reason,
+                    "；".join(candidate.advice.evidence),
+                    candidate.metadata.path,
+                ),
+            )
+            shown += 1
+
+        total = len(self.reviewed_candidates)
+        if not total:
+            self.review_count_label.configure(text="")
+        elif shown < total:
+            self.review_count_label.configure(text=f"显示 {shown} / 共 {total} 条（已折叠 {total - shown} 条，含 {hidden_uncertain} 条人工确认）")
+        else:
+            self.review_count_label.configure(text=f"共 {total} 条")
+
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
         state = "disabled" if busy else "normal"
         self.scan_button.configure(state=state)
         self.admin_button.configure(state=state)
         self.ai_test_button.configure(state=state)
         self.ai_config_button.configure(state=state)
         self.review_button.configure(state=state)
+        self.overview_button.configure(state=state)
+        self._refresh_delete_state()
 
     def _poll_events(self) -> None:
         try:
@@ -927,6 +1242,8 @@ class DiskAssistantGUI:
                 elif event == "scan_done":
                     snapshot_id, file_count, drive, elapsed = payload  # type: ignore[misc]
                     self.snapshot_id = snapshot_id
+                    self._delete_marks.clear()  # 新快照的路径集合与旧勾选不再对应
+                    self._refresh_delete_state()
                     self.used_bytes, _count = self.inventory.volume_usage(snapshot_id)
                     self.progress.configure(value=100)
                     self._set_busy(False)
@@ -939,7 +1256,8 @@ class DiskAssistantGUI:
                             f"总空间 {format_size(total)} │ 文件占用 {format_size(self.used_bytes)} ({pct}%) │ 可用 {format_size(free)}"
                         )
                     self.status_var.set(
-                        f"扫描完成：{file_count} 个文件，耗时 {elapsed:.1f} 秒。双击目录进入，勾选后送 AI 评审。"
+                        f"扫描完成：{file_count} 个文件，耗时 {elapsed:.1f} 秒。"
+                        "双击目录进入，选中后送 AI 评审；行首方框勾选后可删除（移入回收站）。"
                     )
                     self._go_root()
                 elif event == "scan_cancelled":
@@ -969,14 +1287,60 @@ class DiskAssistantGUI:
                     self._set_busy(False)
                     self.status_var.set("评审失败。")
                     messagebox.showerror("评审失败", str(payload))
+                elif event == "delete_done":
+                    deleted, failed, refused, freed, elapsed = payload  # type: ignore[misc]
+                    self._delete_marks.difference_update(deleted)
+                    self.used_bytes, _count = self.inventory.volume_usage(self.snapshot_id or 0)
+                    total, free, _used = volume_capacity(self.volume_var.get())
+                    if total:
+                        pct = self.used_bytes * 100 // total
+                        self.space_var.set(
+                            f"总空间 {format_size(total)} │ 文件占用 {format_size(self.used_bytes)} ({pct}%) │ 可用 {format_size(free)}"
+                        )
+                    self._refresh_current_view()
+                    self._set_busy(False)
+                    message = (
+                        f"已删除 {len(deleted)} 个文件（释放 {format_size(freed)}），移入回收站，"
+                        f"耗时 {elapsed:.1f} 秒。"
+                    )
+                    if failed:
+                        message += f" {len(failed)} 个未能删除（被占用、权限不足或已被移动）。"
+                    if refused:
+                        message += f" {len(refused)} 个勾选目标被拒绝（见确认框说明）。"
+                    self.status_var.set(message)
+                    if failed:
+                        preview = "\n".join(f"· {path}" for path in failed[:8])
+                        more = f"\n…… 以及另外 {len(failed) - 8} 项" if len(failed) > 8 else ""
+                        messagebox.showwarning(
+                            "部分目标未删除", f"以下目标未能删除：\n{preview}{more}"
+                        )
+                elif event == "delete_error":
+                    self._set_busy(False)
+                    self.status_var.set("删除失败。")
+                    messagebox.showerror("删除失败", str(payload))
+                elif event == "overview_done":
+                    scope, narrative, path, elapsed, stats = payload  # type: ignore[misc]
+                    self._set_busy(False)
+                    self.status_var.set(
+                        f"AI 深度分析完成：{scope}，耗时 {elapsed:.1f} 秒；已保存 {path}"
+                    )
+                    self._show_overview(scope, narrative, path, elapsed, stats)
+                elif event == "overview_error":
+                    self._set_busy(False)
+                    self.status_var.set("AI 深度分析未完成。")
+                    messagebox.showwarning("深度分析未完成", str(payload))
                 elif event == "ai_test_done":
                     api_style, model, advice, stats = payload  # type: ignore[misc]
                     self._set_busy(False)
                     self.status_var.set(f"AI 连接成功：{api_style} / {model}；请求 {stats.api_calls} 次。")
                     messagebox.showinfo(
                         "AI 连接成功",
-                        f"协议：{api_style}\n模型：{model}\n"
-                        f"结构化结果：{advice.purpose} / {advice.advice_level}\n"
+                        f"协议：{api_style}\n模型：{model}\n\n"
+                        "连接测试说明：程序向 AI 发送了一个示例文件"
+                        "（Temp 目录的 connection_test.tmp，128 B），\n"
+                        "AI 返回了合法的结构化判定——说明密钥、接口协议与"
+                        "结构化输出均正常，可以开始评审。\n\n"
+                        f"示例文件的判定：{advice.purpose} / {advice.advice_level}\n"
                         f"理由：{advice.reason}",
                     )
                 elif event == "ai_test_error":

@@ -45,6 +45,7 @@ AI_ENV_KEYS = (
     "AI_CACHE_PATH",
     "AI_PRIVACY_MODE",
     "AI_USER_AGENT",
+    "AI_OVERVIEW_MAX_TOKENS",
 )
 
 
@@ -174,6 +175,8 @@ class Settings:
     ai_privacy_mode: str = "balanced"
     ai_api_style: str = "chat_completions"
     ai_user_agent: str = DEFAULT_USER_AGENT
+    # 深度分析（自由综述）的输出上限：长文必须显式声明预算，否则服务端默认值会截断正文。
+    ai_overview_max_tokens: int = 2400
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -190,4 +193,5 @@ class Settings:
             ai_cache_path=os.getenv("AI_CACHE_PATH", DEFAULT_CACHE_PATH),
             ai_privacy_mode=normalize_privacy_mode(os.getenv("AI_PRIVACY_MODE", "balanced")),
             ai_user_agent=os.getenv("AI_USER_AGENT", DEFAULT_USER_AGENT).strip() or DEFAULT_USER_AGENT,
+            ai_overview_max_tokens=_env_int("AI_OVERVIEW_MAX_TOKENS", 2400, 256),
         )

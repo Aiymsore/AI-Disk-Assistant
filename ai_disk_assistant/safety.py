@@ -3,7 +3,8 @@
 - 常量区：受保护目录 + 全部后缀集合（唯一定义处，scanner 打分也从这里导入）。
 - local_safety_guard：本地规则判定，凡返回 source="local-guard" 的结论 AI 无权推翻。
 - decide_unit_advice：判定单元决策表（never-upgrade），AI 只能让建议更保守。
-本工具只产出建议与报告，不做任何删除动作——因此这里没有任何"删除执行"类接口。
+本工具的自动流程只产出建议与报告，不做任何删除动作；删除执行接口在 cleaner.py，
+仅接受用户显式勾选并二次确认的目标，且受这里的受保护目录名单约束。
 """
 
 from __future__ import annotations

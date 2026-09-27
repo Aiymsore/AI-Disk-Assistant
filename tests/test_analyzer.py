@@ -88,6 +88,7 @@ class AnalyzerSmokeTests(unittest.TestCase):
         )
         areas_body = {"areas": [{"id": 0, "reason": "体积最大"}]}
         reviews_body = {"reviews": [{"id": 0, "verdict": "likely", "reason": "同名副本散落"}]}
+        narrative_text = "## 总体判断\nother 目录里有两个同体积安装包，建议先核对再处理。"
 
         def fake_response(body):
             content = json.dumps(body, ensure_ascii=False)
@@ -106,13 +107,32 @@ class AnalyzerSmokeTests(unittest.TestCase):
 
             return _Resp()
 
+        def plain_response(text):
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def read(self):
+                    return json.dumps(
+                        {"choices": [{"message": {"content": text}}]}, ensure_ascii=False
+                    ).encode("utf-8")
+
+            return _Resp()
+
         def fake_snapshot(drive, inventory, progress=None, **_kwargs):
             snapshot_id = self._seed(inventory)
             return snapshot_id, len(self.files)
 
         with patch(
             "ai_disk_assistant.ai_advisor.urllib.request.urlopen",
-            side_effect=[fake_response(areas_body), fake_response(reviews_body)],
+            side_effect=[
+                fake_response(areas_body),
+                fake_response(reviews_body),
+                plain_response(narrative_text),
+            ],
         ), patch("ai_disk_assistant.analyzer.snapshot_volume", side_effect=fake_snapshot):
             result = analyze_root(
                 self.temp_dir,
@@ -120,12 +140,31 @@ class AnalyzerSmokeTests(unittest.TestCase):
                 area_limit=1,
                 inventory_path=self.inventory_path,
             )
-        # 阶段一圈区域 1 次 + 重复组判读 1 次（big 下钻用启发式？不——AI 可用时下钻也调
-        # suggest_areas，但 area_limit=1 且 big 的子目录圈选命中 1 次；合计 3 次）。
-        # AI 调用共 2 次：阶段一圈区域 + 重复组判读（.msi 由本地守卫裁决，不耗 AI）。
-        self.assertEqual(advisor.stats.api_calls, 2)
+        # AI 调用共 3 次：阶段一圈区域 + 重复组判读 + 深度分析综述；
+        # big 未进入圈选（area_limit=1 且 other 体积最大），.msi 由本地守卫裁决，均不耗 AI。
+        self.assertEqual(advisor.stats.api_calls, 3)
         self.assertEqual(result.duplicates[0].verdict, "likely")
         self.assertEqual(result.duplicates[0].comment, "同名副本散落")
+        # 综述只落在 AnalyzeResult.narrative 上，不回流任何判定。
+        self.assertEqual(result.narrative, narrative_text)
+        for item in result.candidates:
+            self.assertNotEqual(item.advice.source, "overview")
+
+    def test_narrative_absent_without_ai(self) -> None:
+        """无 AI 时不做综述请求，也不产生 narrative（启发式路径完全不受影响）。"""
+
+        def fake_snapshot(drive, inventory, progress=None, **_kwargs):
+            snapshot_id = self._seed(inventory)
+            return snapshot_id, len(self.files)
+
+        with patch("ai_disk_assistant.analyzer.snapshot_volume", side_effect=fake_snapshot):
+            result = analyze_root(
+                self.temp_dir,
+                no_ai_advisor(),
+                area_limit=1,
+                inventory_path=self.inventory_path,
+            )
+        self.assertIsNone(result.narrative)
 
     def test_invalid_root_raises(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

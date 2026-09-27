@@ -39,7 +39,7 @@
 | 安全底线层 | `safety.py` | 受保护目录、后缀集合（唯一定义处）、本地规则守卫、删除前置检查 |
 | 元数据/隐私/配置 | `metadata.py` / `privacy.py` / `config.py` | stat 快照采集；AI 请求字段裁剪；.env 读写与 Settings |
 | AI 决策层 | `ai_advisor.py` + `cache.py` | 混合决策：本地守卫优先，AI 批量判断 + 缓存 + 失败降级 |
-| 业务层 | `scanner.py` / `cleaner.py` / `report.py` | 扫描打分；回收站清理；四种报告产物 |
+| 业务层 | `scanner.py` / `cleaner.py` / `report.py` | 扫描打分；手动删除执行（回收站）；四种报告产物 |
 | 入口层 | `cli.py` / `gui.py` | 两条交互入口，共用同一套业务层与公共函数 |
 
 ## 三、一次扫描的完整数据流
@@ -60,7 +60,8 @@ cli.command_scan / gui._scan_worker
           → _apply_hybrid_guard         混合守卫降级
       6. 超出 AI 限额的候选 → safe_fallback_advice（人工确认）
   → write_all_reports (report.py:145)：CSV + summary JSON + HTML（明细 JSON 可选）
-  → 可选：cleaner.move_to_trash（先 can_move_to_trash + verify_file_unchanged 复核）
+  → 手动删除（GUI 专属）：gui._delete_checked 勾选确认 → cleaner.plan_deletion 展开守卫
+    → cleaner.recycle_paths 回收站 → inventory.remove_files/remove_dir_subtree 回删快照
 ```
 
 ## 四、模块职责与关键位置
@@ -100,8 +101,10 @@ cli.command_scan / gui._scan_worker
 | 分节 | 行号 | 说明 |
 |---|---|---|
 | `SYSTEM_PROMPT` | 34 | 枚举清单须与 models.PURPOSES/ADVICE_LEVELS 同步 |
+| `DEEP_ANALYSIS_SYSTEM_PROMPT` | — | 深度分析综述提示词（唯一不返回 JSON 的任务）；`OVERVIEW_PROMPT_VERSION` 进文本缓存键 |
 | `AdvisorStats` | 63 | token/耗时仅落盘 summary JSON，不在界面展示（有意保留） |
 | `_extract_json` / `_validate_advice` | 80 / 104 | 容错提取 JSON；严格校验字段与值域 |
+| `_clean_markdown` | — | 自由文本清理（剥掉模型习惯性包裹的 ``` 围栏） |
 | `_chat_content_to_text` / `_responses_content_to_text` | 143 / 160 | 两种 API 协议的文本抽取（共用 `_text_part_to_str`） |
 | `HybridAdvisor.advise_many` | 236 | 生产入口：本地守卫优先 → AI 批量 → 失败降级 |
 | `advise_ai_only_many` | 275 | **仅评测用**（run_benchmark.py），生产路径不走 |
@@ -109,13 +112,25 @@ cli.command_scan / gui._scan_worker
 | `_fallback_advice` / `_apply_hybrid_guard` | 301 / 314 | AI 失败降级；AI 建议删除时的双重本地闸门 |
 | `_request_ai_batch_resilient` | 373 | 坏样本二分拆批，避免整批报废 |
 | `_request_ai_batch` | 411 | HTTP + 重试（429/5xx 指数退避）+ id 完整性校验 |
+| `summarize_overview` | — | **深度分析综述**：自由 Markdown，走 `cache.get_text/set_text`，失败返回 None（绝不影响判定） |
 | `build_advisor` | 502 | CLI/GUI 共用的构造工厂（读 .env → Settings → HybridAdvisor） |
+
+### overview.py — 深度分析事实层
+`build_overview_payload` 是唯一入口：把快照库聚合成"整盘/整目录视图"（范围总量、直接子目录排名、
+深层热点、后缀构成、最大文件、重复组、本次评审分布），路径按隐私档裁剪。
+设计边界：它产出的是**展示性事实**，只喂给 `summarize_overview`；综述进 `AnalyzeResult.narrative`，
+永远不会写回 `recommend_delete`。新增范围查询在 `inventory.py`：
+`subtree_usage` / `largest_files` / `top_dirs(under=…)` / `child_dirs(limit=…)`。
 
 ### scanner.py（211 行）— 扫描层
 `ScanPolicy`（32，**CLI/GUI 默认值唯一来源**）、`_iter_files`（42）、`_candidate_signals`（57，多信号打分）、`_retain_top_candidate`（116，小顶堆）、`scan_with_stats`（133，主流程）。
 
-### cleaner.py（77 行）— 清理层
-`select_auto_candidates`（20）、`verify_file_unchanged`（28，TOCTOU 复核：大小/mtime/设备号/inode）、`move_to_trash`（54）。
+### cleaner.py — 手动删除执行层
+唯一删除入口，只接受 GUI 行首方框勾选 + 二次确认的目标：
+`DeletionPlan` / `plan_deletion`（勾选路径 → 快照归类 classify_paths → 目录子树展开去重 → 受保护路径与快照外路径拒绝）、
+`recycle_paths`（分块执行 + 存在性复核输出 (deleted, failed)；Windows = `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站，executor/verify 可注入便于测试）、
+`prune_empty_dirs`（目录勾选删除后清除空目录壳，非空残余天然保留）。
+快照回删由调用方（gui._delete_worker）经 `inventory.remove_files` / `remove_dir_subtree` 完成并重跑 `refresh_dir_aggregates`。
 
 ### report.py（246 行）— 报告层
 `FIELDNAMES`（22）、`write_csv`（50）/ `write_json`（61）、`build_summary`（70）、`write_all_reports`（145，**CLI/GUI 共用流水线**）、`write_html_report`（183）。
@@ -135,8 +150,8 @@ cli.command_scan / gui._scan_worker
 
 ## 五、并发模型（gui.py）
 
-所有耗时操作（扫描 / AI 测试 / 移回收站）在 daemon 线程执行，通过 `queue.Queue` 投递
-`("事件名", 载荷)` 元组；主线程 `_poll_events` 以 100ms 间隔轮询并分发。UI 线程绝不直接执行扫描。
+所有耗时操作（扫描 / AI 测试 / 评审 / 深度分析 / 手动删除）在 daemon 线程执行，通过 `queue.Queue` 投递
+`("事件名", 载荷)` 元组；主线程 `_poll_events` 以 100ms 间隔轮询并分发。UI 线程绝不直接执行扫描或删除。
 
 ## 六、维护守则（改代码前先读）
 

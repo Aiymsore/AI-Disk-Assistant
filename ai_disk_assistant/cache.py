@@ -42,6 +42,18 @@ class AdviceCache:
                 )
                 """
             )
+            # 自由文本缓存（AI 深度分析综述）：结构与 advice_cache 同构，只是载荷是 Markdown
+            # 而不是结构化建议——综述不参与判定，不能塞进 Advice 的字段里。
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS text_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
 
     @staticmethod
     def make_key(model: str, privacy_mode: str, payload: dict[str, Any]) -> str:
@@ -77,5 +89,28 @@ class AdviceCache:
                     key,
                     json.dumps(payload, ensure_ascii=False, sort_keys=True),
                     json.dumps(advice.to_dict(), ensure_ascii=False, sort_keys=True),
+                ),
+            )
+
+    def get_text(self, key: str) -> str | None:
+        with self._lock, closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT text FROM text_cache WHERE cache_key = ?", (key,)
+            ).fetchone()
+        if row is None or not str(row[0]).strip():
+            return None
+        return str(row[0])
+
+    def set_text(self, key: str, payload: dict[str, Any], text: str) -> None:
+        with self._lock, closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO text_cache(cache_key, payload_json, text)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    key,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    text,
                 ),
             )

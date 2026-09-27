@@ -1,6 +1,6 @@
 # P4Disk4P
 
-Windows 磁盘分析助手：**直读 NTFS 卷的 $MFT 秒级建立全盘快照**，本地安全规则打底、AI 分层判读，产出可解释的清理建议与报告。**工具只产出建议，永不移动或删除任何文件。**
+Windows 磁盘分析助手：**直读 NTFS 卷的 $MFT 秒级建立全盘快照**，本地安全规则打底、AI 分层判读，产出可解释的清理建议与报告。**自动流程只产出建议，永不移动或删除任何文件**；唯一的删除入口是用户在列表行首勾选 + 二次确认的手动删除，且一律移入回收站（可还原）。
 
 执行分析的硬性前置条件：**管理员权限（MFT 直读）+ 已配置 AI**，缺一在入口拒绝并给出引导（GUI 提供"以管理员重启"一键提权）。
 
@@ -24,13 +24,22 @@ Windows 磁盘分析助手：**直读 NTFS 卷的 $MFT 秒级建立全盘快照*
 
 ### 2. AI 运行规则（`ai_advisor.py` + `safety.py` + `privacy.py` + `cache.py` + `units.py`）
 
-AI 承担**三类独立任务**，各有专属提示词与失败哲学：
+AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 
 | 任务 | 触发位置 | 输入 | 失败时的行为 |
 |---|---|---|---|
 | **判定单元判读**（核心） | 评审管线 `advise_units` | 同目录+同后缀+同大小档的文件组聚合统计 | 降级到本地规则/安全兜底，不中断 |
 | **区域圈选**（建议性） | 全盘分析阶段一 `suggest_areas` | 体积 top 目录摘要 | 返回 None，回退体积启发式 |
 | **重复组判读**（提示性） | 全盘分析 `review_duplicates` | 同体积文件组 | 返回 None，仅放弃提示 |
+| **深度分析综述**（展示性） | `analyze_root` 收尾 / GUI「AI 深度分析」 | 整目录聚合事实（排名、后缀构成、最大文件、重复组、评审分布） | 返回 None，不写综述、不影响任何判定 |
+
+前二/三类任务输出**结构化 JSON**（每单元 5 字段 + 证据 + 枚举），走严格校验与决策表；
+第四类**深度分析综述**（`overview.py` + `summarize_overview`）输出**自由 Markdown 长文**，
+定位是"把磁盘占用截图发给 AI"那种整体解读：空间去了哪、重点区域点评、风险与不确定项、
+建议处理顺序。它与前三类的边界是硬约束——**综述只进报告与界面，永远不参与 `recommend_delete`**，
+因此它既不需要枚举校验，也不可能让某个文件变成"建议删除"。事实载荷来自快照库，
+按隐私三档裁剪路径，并显式声明输出预算（`AI_OVERVIEW_MAX_TOKENS`）；
+缓存键含事实内容哈希，盘面没变时重复分析零成本。
 
 **单元判定的六道关**（`advise_units` + `decide_unit_advice`，任何一道都只能让建议更保守，即 never-upgrade）：
 
@@ -43,7 +52,7 @@ AI 承担**三类独立任务**，各有专属提示词与失败哲学：
 
 **隐私三档**（`privacy.py`）：`strict` 只给目录上下文标记（不发路径）/ `balanced` 匿名化用户名与主目录（默认，GUI 固定此档）/ `full` 原样。载荷中不含任何时间字段。
 
-**兜底原则**：AI 是建议者不是执行者——未配置、请求失败、返回异常、证据不足，任何失败路径最终都落到 `safe_fallback_advice`（"未知用途 + 人工确认 + 不自动删除"），扫描永不中断。工具自身也**永不执行删除**。
+**兜底原则**：AI 是建议者不是执行者——未配置、请求失败、返回异常、证据不足，任何失败路径最终都落到 `safe_fallback_advice`（"未知用途 + 人工确认 + 不自动删除"），扫描永不中断。自动流程**永不执行删除**；唯一的删除入口在 GUI：行首方框勾选 → 二次确认 → `cleaner.py` 移入回收站（受保护目录无条件拒绝）。
 
 ---
 
@@ -56,7 +65,7 @@ AI 承担**三类独立任务**，各有专属提示词与失败哲学：
 | `main.py` | CLI 启动脚本，转发到 `ai_disk_assistant.cli.main` |
 | `gui.py`（根目录） | GUI 启动脚本，转发到 `ai_disk_assistant.gui.main` |
 | `ai_disk_assistant/cli.py` | 子命令 `inspect`（判断单个文件，走逐文件管线）与 `analyze`（整卷区域分析）；前置条件校验、参数解析、控制台输出 |
-| `ai_disk_assistant/gui.py` | Tkinter 界面 + 纯 ttk 视觉系统（`_setup_style`，DPI 感知适配高分屏）：卷选择、扫描控制（暂停/继续/取消）、目录下钻浏览（双击进入）、扩展名分类面板、勾选送 AI 评审、`AIConfigDialog` 图形编辑 .env。扫描/评审跑后台线程，经事件队列回主线程刷新 |
+| `ai_disk_assistant/gui.py` | Tkinter 界面 + 纯 ttk 视觉系统（`_setup_style`，DPI 感知适配高分屏）：卷选择、扫描控制（暂停/继续/取消）、目录下钻浏览（双击进入）、扩展名分类面板、选中送 AI 评审（结果按"只看建议清理"折叠人工确认）、行首方框勾选 + 「删除勾选」（移入回收站）、`AIConfigDialog` 图形编辑 .env。扫描/评审/删除跑后台线程，经事件队列回主线程刷新 |
 
 ### 扫描层
 
@@ -89,20 +98,23 @@ AI 承担**三类独立任务**，各有专属提示词与失败哲学：
 | `ai_disk_assistant/cache.py` | SQLite 建议缓存（WAL），键由 `make_key` 统一构造 |
 | `ai_disk_assistant/privacy.py` | 三档隐私裁剪 + 路径匿名化（`anonymize_path`），载荷键名即证据校验白名单 |
 | `ai_disk_assistant/units.py` | 判定单元归并：`size_bucket` 大小分桶（桶边界一经发布只能追加）、`unit_fingerprint` 稳定模式指纹、`build_units` 按最高候选分降序输出 |
+| `ai_disk_assistant/overview.py` | 深度分析事实层：`build_overview_payload` 把快照库聚合成"整盘/整目录视图"（范围总量、子目录排名、深层热点、后缀构成、最大文件、重复组、本次评审分布），按隐私三档裁剪路径；与 units.py 的**逐条视角**互补，是唯一产出自由长文的载荷 |
 
 ### 支撑层
 
 | 文件 | 职责 |
 |---|---|
+| `ai_disk_assistant/cleaner.py` | 手动删除执行层（GUI 勾选 + 二次确认后的唯一删除入口）：`plan_deletion` 按快照库展开目录子树/去重并拒绝受保护路径，`recycle_paths` 分块执行 + 存在性复核（Windows 走 `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站），`prune_empty_dirs` 清掉删空后的目录壳；快照回删由调用方经 `inventory.remove_files` / `remove_dir_subtree` 完成 |
 | `ai_disk_assistant/metadata.py` | `format_size` / `format_mtime`（垃圾时间显示"—"，防脏数据中断渲染）/ `format_pct`（一位小数百分比）；`get_file_metadata` 采集单文件 stat 快照（CLI inspect 用） |
 | `ai_disk_assistant/config.py` | 手写 .env 解析器（保留注释与未知行）、`Settings.from_env`、默认路径/UA 的唯一定义处；PyInstaller 冻结环境下配置跟随可执行文件 |
 | `ai_disk_assistant/admin.py` | 管理员检测（`is_user_admin`）与 UAC 提权重启（`relaunch_as_admin`）、分析前置条件清单 |
 | `ai_disk_assistant/models.py` | 数据结构基座：`FileMetadata`/`Unit`/`Advice`/`Candidate`/`ScanStats`、合法值域（`PURPOSES`/`ADVICE_LEVELS`）、统一兜底约束（`Advice.__post_init__`）与安全默认工厂（`safe_fallback_advice`） |
-| `ai_disk_assistant/report.py` | CSV / 明细 JSON / 统计摘要 JSON / HTML 四种报告，`write_all_reports` 为唯一流水线 |
+| `ai_disk_assistant/report.py` | CSV / 明细 JSON / 统计摘要 JSON / HTML 四种报告 + AI 综述 Markdown，`write_all_reports` 为唯一流水线；`markdown_to_html` 是零依赖的 Markdown 子集渲染（先转义再套标签，模型输出无法注入 HTML） |
+| `ai_disk_assistant/analyzer.py` | 全盘区域分析：圈区域 → 递归下钻 → 叶子评分 → 重复组提示 → **深度分析综述**（写入 `AnalyzeResult.narrative`，只作展示，不回流判定） |
 
 ### 外围脚本
 
-- `tests/`：90 个用例——MFT 解析纯函数与合成整卷端到端、快照库聚合与回收、守卫真值表、决策表、证据校验、单元缓存、区域分析（启发式 + AI mock）、协议解析、.env 读写、报告生成、DPI 无关的格式化函数
+- `tests/`：112 个用例——MFT 解析纯函数与合成整卷端到端、快照库聚合与回收、守卫真值表、决策表、证据校验、单元缓存、区域分析（启发式 + AI mock）、协议解析、.env 读写、报告生成、手动删除计划/执行/快照同步、DPI 无关的格式化函数
 - `tools/test_ai_connection.py`：独立验证 AI 密钥、协议与结构化返回
 - `evaluation/run_benchmark.py`：标注数据上对比 `local_rules` / `pure_ai` / `hybrid` 三种方案
 - `demo/create_demo_files.py`：生成演示文件树
@@ -114,7 +126,13 @@ AI 承担**三类独立任务**，各有专属提示词与失败哲学：
 1. GUI 选卷 → 管理员权限校验 → `snapshot_volume` 直读 $MFT 建快照（唯一事实来源），完成后自动回收旧快照
 2. 目录树双击下钻，数据全部来自快照库（毫秒级）；扩展名面板同步聚合
 3. 勾选目录/文件 → 快照事实评分 → 归并判定单元 → `advise_units`（守卫 → 缓存 → AI → 证据闸门 → 决策表）
-4. 候选列表按建议等级着色，报告落盘（CSV/JSON/HTML）；工具不执行任何删除
+4. 候选列表按建议等级着色，报告落盘（CSV/JSON/HTML）；自动流程不执行任何删除
+5. **手动删除（可选）**：列表行首方框勾选文件/目录（点表头全选）→ 顶栏「删除勾选」→
+   二次确认（显示文件数/体积/被拒目标）→ `plan_deletion` 展开子树并拒绝受保护路径 →
+   `recycle_paths` 移入回收站 → 按磁盘事实回删快照行并刷新目录聚合与当前视图
+6. **深度分析（可选）**：GUI 点「AI 深度分析（当前目录）」或 CLI `analyze` 收尾时，把当前范围的聚合事实
+   （排名、后缀构成、最大文件、重复组、评审分布）一次性交给 AI，写出一份自由 Markdown 综述并落盘；
+   综述同时进入 HTML 报告顶部与独立的 `reports/…_analysis.md`，界面提供复制全文与打开文件
 
 ## 四、相关文档
 

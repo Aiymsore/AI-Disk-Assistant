@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- 修复 GUI 每次关闭后弹出 `Failed to remove temporary directory`（`%TEMP%\_MEI…`）警告的问题：单文件 EXE 退出时 PyInstaller 引导器要删除解包临时目录，若后台线程（扫描循环/AI 请求重试）仍在运行，句柄未释放导致清理失败并弹窗。现在关窗与提权重启统一走 `_on_close`：先取消扫描、再以 `os._exit(0)` 立即终止进程，句柄随进程释放，临时目录必能清掉。
+- 新增评审结果**折叠开关**：底部候选列表默认只显示"建议删除/谨慎删除"两档（"只看建议清理"开关，可随时切换），大量"人工确认"不再刷屏；折叠时显示"显示 X / 共 N 条（已折叠 M 条，含 K 条人工确认）"，数据完整保留、报告不裁剪。
+- **AI 提示词全面扩写**：五个提示词（判定单元/逐文件/区域圈选/重复组/深度分析）补齐"裁判手册"——目录上下文×后缀×数量档的判据参考、四级建议的分级标尺（建议删除须多信号互相印证；仅凭体积大/数量多不得建议删除；.db/.dat 等个人数据倾向人工确认）、reason 语录规范（定性+关键依据+核对点，附分等级范例，禁止套话）、匿名化路径与 mtime 不可靠的显式说明；深度分析综述新增第 8 条语气要求并可建议使用本工具的回收站删除。缓存版本递增（`unit-prompt-4` / `overview-prompt-2`），旧判定自动失效重判。
+- 修复逐文件建议缓存键缺失提示词版本的问题：`_prompt_version` 现已进入缓存键，与单元管线同获"提示词升级即重判"的保证。
+- 清理第一版配置残留：`.env` 中遗留的 `AI_USER_AGENT=AI-Disk-Assistant/1.3.0` 已移除（默认值随程序版本自动更新），`.env.example` 同步更名为 P4Disk4P。配置读取自程序所在目录的 `.env` 文件，程序内无旧版硬编码。
+- 新增提示词枚举同步测试：PURPOSES/ADVICE_LEVELS 与两个结构化提示词的枚举清单、以及证据示例字段名的真实性均有测试守护。
+- 新增 GUI **手动删除**：文件列表行首新增勾选方框（点击切换，点"全选"表头对当前列表全选/反选），顶栏扫描行新增「删除勾选」按钮——二次确认（文件数/体积/被拒目标/示例路径）后由新增 `cleaner.py` 执行：`plan_deletion` 按快照库展开目录子树、去重并拒绝受保护目录与快照外路径；`recycle_paths` 在 Windows 上经 `SHFileOperationW(FO_DELETE + FOF_ALLOWUNDO)` 移入回收站（可还原，不设 FOF_NOCONFIRMATION 以防超大文件被静默永久删除），删除后按磁盘事实回删快照行、清空目录壳并刷新聚合与当前视图。自动流程（扫描/评审/报告/综述）依旧不触碰文件系统。
+- 新增 **AI 深度分析综述**：把整盘/整目录的聚合事实（子目录排名、深层热点、后缀构成、最大文件、重复组、本次评审分布）一次性交给 AI，输出自由 Markdown 长文——空间去向、重点区域点评、风险与不确定项、建议处理顺序。
+- 新增 `overview.py`（事实聚合层，按 strict/balanced/full 裁剪路径）与 `HybridAdvisor.summarize_overview`（唯一不返回 JSON 的 AI 任务；显式 `AI_OVERVIEW_MAX_TOKENS` 输出预算；缓存键含事实内容哈希，盘面未变则零成本复用）。
+- 新增 GUI「AI 深度分析」按钮与综述阅读窗口（标题分层显示、复制全文、打开 Markdown），CLI `analyze` 打印综述并支持 `--overview-md`。
+- 报告体系增加第五种产物：综述 Markdown，并入 HTML 报告顶部（零依赖 Markdown 子集渲染，先转义后套标签）。
+- 新增 `cache.py` 文本缓存表与 `inventory.py` 的范围查询（`subtree_usage` / `largest_files` / `top_dirs(under=…)` / `child_dirs(limit=…)`）。
+- CLI 打印自由文本时做编码兜底，避免 GBK 控制台因模型输出的非 GBK 字符中断流程。
+
 ## v1.2.1
 
 - 修正 Windows PowerShell 虚拟环境激活命令。

@@ -16,20 +16,29 @@ flowchart TD
     L --> M[Hybrid safety guard]
     I --> M
     M --> N[CSV / JSON / HTML audit report]
-    N --> O{User types TRASH?}
-    O -->|No| P[No file changes]
-    O -->|Yes| Q[TOCTOU snapshot verification]
-    Q --> R[Move unchanged files to recycle bin]
+    N --> O[No file changes by automated flow]
+    O --> P{GUI manual delete: row checkbox + confirm?}
+    P -->|No| Q[Nothing happens]
+    P -->|Yes| R[Plan: expand subtrees, refuse protected paths]
+    R --> S[Recycle bin via SHFileOperationW]
+    S --> T[Prune snapshot rows and refresh aggregates]
 ```
 
 ## Design boundaries
 
+0. The **deep-analysis overview** is a display-only AI task: it consumes aggregate snapshot facts and
+   returns free Markdown. It never feeds `recommend_delete`, so it is exempt from the enum validation
+   that guards the per-unit decision path.
 1. File contents are never read or uploaded.
 2. The default `balanced` privacy mode masks the operating-system username before an AI request.
 3. AI cannot bypass protected paths, protected suffixes or automatic-cleanup eligibility rules.
 4. AI output must pass strict type, enum, count and identifier validation.
 5. API failures fail closed; cached or local results never widen the deletion scope.
 6. The scanner traverses the full directory and keeps a bounded Top-N heap instead of stopping at the first N matches.
-7. Before a recycle-bin operation, the program verifies size, modification time, device and file identity against the scan snapshot.
-8. Whole-folder and permanent deletion are intentionally disabled in the public version.
+7. The automated pipeline never touches the filesystem. The only deletion path is the GUI manual flow
+   (`cleaner.py`): per-row checkbox + confirmation dialog, subtrees expanded from snapshot facts, and
+   protected paths refused unconditionally.
+8. Manual deletion always moves files to the recycle bin (`SHFileOperationW` + `FOF_ALLOWUNDO`, no
+   `FOF_NOCONFIRMATION` so oversized files cannot be silently permanent-deleted); outcomes are settled
+   by an existence re-check. Permanent deletion stays disabled.
 9. The pure-AI path exists only in the benchmark script and is never connected to the cleaner.

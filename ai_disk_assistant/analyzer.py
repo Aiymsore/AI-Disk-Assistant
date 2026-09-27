@@ -20,6 +20,7 @@ from .inventory import DirAgg, FileRow, Inventory
 from .mft_scanner import snapshot_volume
 from .metadata import format_mtime, format_size
 from .models import Candidate, FileMetadata, ScanStats
+from .overview import build_overview_payload
 from .privacy import anonymize_path
 from .scanner import ScanPolicy, _signals_from_facts, judge_metadata_records
 from .safety import is_protected_path
@@ -88,6 +89,8 @@ class AnalyzeResult:
     stats: ScanStats | None = None
     snapshot_file_count: int = 0
     duplicates: list[DuplicateGroup] = field(default_factory=list)
+    # AI 深度分析综述（自由 Markdown）：只作展示，不参与任何判定；未启用 AI 或失败时为 None。
+    narrative: str | None = None
 
 
 def _area_payloads(dir_rows: list[DirAgg]) -> list[dict[str, object]]:
@@ -371,10 +374,28 @@ def analyze_root(
     stats.retained_candidates = kept
     stats.unit_count = unit_count
     stats.units_judged = unit_count  # 无数量上限：全部单元实判。
-    return AnalyzeResult(
+    result = AnalyzeResult(
         areas=areas,
         candidates=all_candidates,
         stats=stats,
         snapshot_file_count=file_count,
         duplicates=duplicates,
     )
+
+    # 深度分析综述：在逐条判定之外补一份全局视角（占比排名、最大文件、重复组、评审分布）。
+    # 只写 result.narrative，不回流任何判定——综述说得再激进也不会让文件被建议删除。
+    if advisor.ai_available:
+        log("正在生成 AI 深度分析综述……")
+        try:
+            payload = build_overview_payload(
+                inventory,
+                snapshot_id,
+                str(root_path),
+                privacy_mode=advisor.settings.ai_privacy_mode,
+                review=result,
+            )
+            result.narrative = advisor.summarize_overview(payload)
+        except (ValueError, OSError):
+            # 聚合或请求失败都不影响已经完成的分析结果。
+            result.narrative = None
+    return result
