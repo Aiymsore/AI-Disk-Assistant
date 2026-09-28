@@ -105,7 +105,7 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 
 | 文件 | 职责 |
 |---|---|
-| `ai_disk_assistant/cleaner.py` | 手动删除执行层（GUI 勾选 + 二次确认后的唯一删除入口）：`plan_deletion` 按快照库展开目录子树/去重并拒绝受保护路径，`recycle_paths` 分块执行 + 存在性复核（Windows 走 `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站），`prune_empty_dirs` 清掉删空后的目录壳；快照回删由调用方经 `inventory.remove_files` / `remove_dir_subtree` 完成 |
+| `ai_disk_assistant/cleaner.py` | 手动删除执行层（GUI 勾选 + 二次确认后的唯一删除入口）：`plan_deletion` 按快照库展开目录子树/去重并拒绝受保护路径，`split_permanent` 读回收站配额预测"会被永久删除"的目标供确认框提前告知，`recycle_paths` 分块执行 + 存在性复核（Windows 走 `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站，弹窗父化到应用窗口并显示进度），`prune_empty_dirs` 清掉删空后的目录壳；快照回删由调用方经 `inventory.remove_files` / `remove_dir_subtree` 完成 |
 | `ai_disk_assistant/metadata.py` | `format_size` / `format_mtime`（垃圾时间显示"—"，防脏数据中断渲染）/ `format_pct`（一位小数百分比）；`get_file_metadata` 采集单文件 stat 快照（CLI inspect 用） |
 | `ai_disk_assistant/config.py` | 手写 .env 解析器（保留注释与未知行）、`Settings.from_env`、默认路径/UA 的唯一定义处；PyInstaller 冻结环境下配置跟随可执行文件 |
 | `ai_disk_assistant/admin.py` | 管理员检测（`is_user_admin`）与 UAC 提权重启（`relaunch_as_admin`）、分析前置条件清单 |
@@ -115,7 +115,7 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
 
 ### 外围脚本
 
-- `tests/`：112 个用例——MFT 解析纯函数与合成整卷端到端、快照库聚合与回收、守卫真值表、决策表、证据校验、单元缓存、区域分析（启发式 + AI mock）、协议解析、.env 读写、报告生成、手动删除计划/执行/快照同步、DPI 无关的格式化函数
+- `tests/`：125 个用例——MFT 解析纯函数与合成整卷端到端、快照库聚合与回收、守卫真值表、决策表、证据校验、单元缓存、区域分析（启发式 + AI mock）、协议解析、.env 读写、报告生成、手动删除计划/执行/回收站容量预测/快照同步、DPI 无关的格式化函数
 - `tools/test_ai_connection.py`：独立验证 AI 密钥、协议与结构化返回
 - `evaluation/run_benchmark.py`：标注数据上对比 `local_rules` / `pure_ai` / `hybrid` 三种方案
 - `demo/create_demo_files.py`：生成演示文件树
@@ -130,8 +130,9 @@ AI 承担**四类独立任务**，各有专属提示词与失败哲学：
    结果按处理建议着色、可只看"可清理"；纯展示任务，不经过守卫与判定管线，不参与任何自动行为
 4. 自动流程不执行任何删除；介绍结果缓存复用（提示词版本进缓存键）
 5. **手动删除（可选）**：列表行首方框勾选文件/目录（点表头全选）→ 顶栏「删除勾选」→
-   二次确认（显示文件数/体积/被拒目标）→ `plan_deletion` 展开子树并拒绝受保护路径 →
-   `recycle_paths` 移入回收站 → 按磁盘事实回删快照行并刷新目录聚合与当前视图
+   二次确认（显示文件数/体积/被拒目标，以及**超回收站容量将被永久删除**的目标）→
+   `plan_deletion` 展开子树并拒绝受保护路径 → `recycle_paths` 移入回收站
+   （系统弹窗父化到应用窗口、显示进度与"已删 i/n"状态）→ 按磁盘事实回删快照行并刷新目录聚合与当前视图
 6. **深度分析（可选）**：GUI 点「AI 深度分析（当前目录）」或 CLI `analyze` 收尾时，把当前范围的聚合事实
    （排名、后缀构成、最大文件、重复组、评审分布）一次性交给 AI，写出一份自由 Markdown 综述并落盘；
    综述同时进入 HTML 报告顶部与独立的 `reports/…_analysis.md`，界面提供复制全文与打开文件

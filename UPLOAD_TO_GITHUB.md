@@ -23,7 +23,7 @@ python gui.py
 ```powershell
 git init
 git add .
-git commit -m "feat: release AI Disk Assistant v1.2.1"
+git commit -m "feat: release AI Disk Assistant v1.4.1"
 git branch -M main
 git remote add origin https://github.com/你的用户名/AI-Disk-Assistant.git
 git push -u origin main
@@ -58,8 +58,8 @@ GitHub 页面进入 `Actions` → `Windows Release` → `Run workflow`。完成�
 正式发布时创建标签：
 
 ```powershell
-git tag v1.2.1
-git push origin v1.2.1
+git tag -a v1.4.1 -m "AI Disk Assistant v1.4.1"
+git push origin v1.4.1
 ```
 
 工作流会创建 Release 并上传 EXE。

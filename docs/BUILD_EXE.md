@@ -33,7 +33,10 @@ dist/P4Disk4P-GUI.exe
 2. 未配置 `.env` 时本地规则是否正常；
 3. `.env` 放在 EXE 同目录后 AI 连接是否正常；
 4. Demo、扫描、报告导出是否正常；
-5. 杀毒软件是否误报。
+5. 杀毒软件是否误报；
+6. 大文件删除：勾选一个**超过该盘回收站容量**的文件执行「删除勾选」，二次确认框应出现
+   "⚠ …将被永久删除、无法还原"的预告；点"是"后系统弹窗必须出现在应用窗口**正上方**
+   （不被主窗口遮挡），状态栏显示"正在删除 i/n"，进程不卡死、无隐藏对话框。
 
 ## 使用 GitHub Actions 构建
 
@@ -53,8 +56,8 @@ dist/P4Disk4P-GUI.exe
 正式发布：
 
 ```powershell
-git tag v1.2.1
-git push origin v1.2.1
+git tag -a v1.4.1 -m "AI Disk Assistant v1.4.1"
+git push origin v1.4.1
 ```
 
 工作流会创建 Release 并上传 EXE 与发布压缩包。

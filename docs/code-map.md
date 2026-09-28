@@ -129,7 +129,8 @@ cli.command_scan / gui._scan_worker
 ### cleaner.py — 手动删除执行层
 唯一删除入口，只接受 GUI 行首方框勾选 + 二次确认的目标：
 `DeletionPlan` / `plan_deletion`（勾选路径 → 快照归类 classify_paths → 目录子树展开去重 → 受保护路径与快照外路径拒绝）、
-`recycle_paths`（分块执行 + 存在性复核输出 (deleted, failed)；Windows = `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站，executor/verify 可注入便于测试）、
+`recycle_paths`（分块执行 + 存在性复核输出 (deleted, failed)；Windows = `SHFileOperationW + FOF_ALLOWUNDO` 移入回收站，executor/verify 可注入便于测试；`hwnd` 把系统弹窗父化到应用窗口、`FOF_SIMPLEPROGRESS` 显示系统进度、`suppress_confirm` 仅在已预告永久删除时压掉系统重复确认、`progress(done,total)` 每块回调状态栏）、
+`split_permanent` / `recycle_info`（读注册表 `BitBucket\Volume\{卷}` 的 `MaxCapacity`（MB，缺项按卷容量 5% 兜底）与 `NukeOnDelete`，按执行顺序逐块扣减剩余容量，预测哪些目标会被**永久删除**——GUI 在二次确认框里据此提前告知）、
 `prune_empty_dirs`（目录勾选删除后清除空目录壳，非空残余天然保留）。
 快照回删由调用方（gui._delete_worker）经 `inventory.remove_files` / `remove_dir_subtree` 完成并重跑 `refresh_dir_aggregates`。
 

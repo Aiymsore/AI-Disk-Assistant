@@ -42,7 +42,7 @@ from tkinter import (
 from . import __version__
 from .admin import analysis_blockers, is_user_admin, relaunch_as_admin
 from .ai_advisor import build_advisor
-from .cleaner import DeletionPlan, plan_deletion, prune_empty_dirs, recycle_paths
+from .cleaner import DeletionPlan, plan_deletion, prune_empty_dirs, recycle_paths, split_permanent
 from .config import (
     DEFAULT_CACHE_PATH,
     DEFAULT_INVENTORY_PATH,
@@ -883,11 +883,19 @@ class DiskAssistantGUI:
             messagebox.showwarning("没有可删除的目标", f"勾选的目标均不可删除：\n{detail}")
             return
 
+        # 超出回收站容量/所在卷不支持回收站的目标会被系统永久删除——在这里一次说清，
+        # 后续执行才敢压掉系统的重复确认框（recycle_paths(suppress_confirm=True)）。
+        permanent, _recyclable = split_permanent(plan.targets)
         lines = [
             f"即将删除 {len(plan.targets)} 个文件，共 {format_size(plan.total_bytes)}"
             f"（来自 {len(plan.accepted_dir_marks)} 个勾选目录、{len(plan.accepted_file_marks)} 个勾选文件）。",
             "文件将移入系统回收站，可在回收站中还原。",
         ]
+        if permanent:
+            lines.append(
+                f"⚠ 其中 {len(permanent)} 项、共 {format_size(sum(row.size_bytes for row in permanent))}"
+                "超出回收站容量或所在卷不支持回收站，将被永久删除、无法还原。"
+            )
         if plan.refused:
             lines.append(f"另有 {len(plan.refused)} 个勾选目标被拒绝（受保护目录或快照中不存在）。")
         if len(plan.targets) > 5000:
@@ -901,15 +909,29 @@ class DiskAssistantGUI:
 
         self._set_busy(True)
         self.status_var.set(f"正在删除 {len(plan.targets)} 个文件（移入回收站）……")
+        # 句柄必须在主线程取：Tk 不允许跨线程调用；worker 只把它透传给 shell 弹窗当父窗口。
+        hwnd = self.root.winfo_id()
         threading.Thread(
-            target=self._delete_worker, args=(plan, self.snapshot_id), daemon=True
+            target=self._delete_worker,
+            args=(plan, self.snapshot_id, hwnd, bool(permanent)),
+            daemon=True,
         ).start()
 
-    def _delete_worker(self, plan: DeletionPlan, snapshot_id: int) -> None:
+    def _delete_worker(self, plan: DeletionPlan, snapshot_id: int, hwnd: int, suppress_confirm: bool) -> None:
         """后台线程：回收站执行 → 按磁盘事实回删快照行 → 重算目录聚合。"""
+
+        def on_progress(done: int, total: int) -> None:
+            # 后台线程不碰 Tk：进度经事件队列回主线程刷新状态栏。
+            self.events.put(("delete_progress", (done, total)))
+
         started = time.perf_counter()
         try:
-            deleted, failed = recycle_paths([row.path for row in plan.targets])
+            deleted, failed = recycle_paths(
+                [row.path for row in plan.targets],
+                hwnd=hwnd,
+                suppress_confirm=suppress_confirm,
+                progress=on_progress,
+            )
             deleted_set = set(deleted)
             freed = sum(row.size_bytes for row in plan.targets if row.path in deleted_set)
             if deleted_set:
@@ -1296,6 +1318,9 @@ class DiskAssistantGUI:
                     self._set_busy(False)
                     self.status_var.set("AI 介绍失败。")
                     messagebox.showerror("AI 介绍失败", str(payload))
+                elif event == "delete_progress":
+                    done, total = payload  # type: ignore[misc]
+                    self.status_var.set(f"正在删除 {done}/{total} 个文件（移入回收站）……")
                 elif event == "delete_done":
                     deleted, failed, refused, freed, elapsed = payload  # type: ignore[misc]
                     self._delete_marks.difference_update(deleted)

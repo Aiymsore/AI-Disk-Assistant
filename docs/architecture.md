@@ -38,7 +38,11 @@ flowchart TD
 7. The automated pipeline never touches the filesystem. The only deletion path is the GUI manual flow
    (`cleaner.py`): per-row checkbox + confirmation dialog, subtrees expanded from snapshot facts, and
    protected paths refused unconditionally.
-8. Manual deletion always moves files to the recycle bin (`SHFileOperationW` + `FOF_ALLOWUNDO`, no
-   `FOF_NOCONFIRMATION` so oversized files cannot be silently permanent-deleted); outcomes are settled
-   by an existence re-check. Permanent deletion stays disabled.
+8. Manual deletion always moves files to the recycle bin (`SHFileOperationW` + `FOF_ALLOWUNDO`),
+   with system dialogs parented to the application window and `FOF_SIMPLEPROGRESS` feedback so a
+   confirmation prompt can never be hidden behind the GUI. Targets that would exceed the volume's
+   recycle-bin capacity (or hit a volume that does not support it) are predicted by
+   `split_permanent` from the registry (`MaxCapacity` / `NukeOnDelete`) and disclosed in the app's
+   own confirmation dialog; only then is `FOF_NOCONFIRMATION` set, so oversized files are never
+   deleted silently. Outcomes are settled by an existence re-check. Permanent deletion stays disabled.
 9. The pure-AI path exists only in the benchmark script and is never connected to the cleaner.

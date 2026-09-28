@@ -5,8 +5,14 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 
-from ai_disk_assistant.cleaner import plan_deletion, prune_empty_dirs, recycle_paths
-from ai_disk_assistant.inventory import Inventory
+from ai_disk_assistant.cleaner import (
+    RecycleInfo,
+    plan_deletion,
+    prune_empty_dirs,
+    recycle_paths,
+    split_permanent,
+)
+from ai_disk_assistant.inventory import FileRow, Inventory
 from tests.test_inventory import seed_snapshot
 
 
@@ -104,6 +110,70 @@ class RecyclePathsTests(unittest.TestCase):
             ["/x/a", "/x/a", "/x/b"], executor=lambda _chunk: None, verify=lambda _p: False
         )
         self.assertEqual(deleted, ["/x/a", "/x/b"])
+
+    def test_progress_reports_cumulative_counts_after_each_chunk(self) -> None:
+        seen: list[tuple[int, int]] = []
+        recycle_paths(
+            [f"/x/{index}" for index in range(1200)],
+            executor=lambda _chunk: None,
+            verify=lambda _p: False,
+            progress=lambda done, total: seen.append((done, total)),
+        )
+        self.assertEqual(seen, [(500, 1200), (1000, 1200), (1200, 1200)])
+
+    def test_progress_not_required(self) -> None:
+        # 不传 progress 时行为与旧版一致，自定义 executor（单参数）不受新增关键字影响。
+        deleted, _failed = recycle_paths(["/x/a"], executor=lambda _chunk: None, verify=lambda _p: False)
+        self.assertEqual(deleted, ["/x/a"])
+
+
+class SplitPermanentTests(unittest.TestCase):
+    """回收站容量预测：超容量/不支持的卷 → 永久删除，剩余容量按执行顺序逐个扣减。"""
+
+    @staticmethod
+    def _rows(*sizes: int) -> list[FileRow]:
+        return [
+            FileRow(path=f"/x/{index}.bin", name=f"{index}.bin", suffix=".bin", size_bytes=size, mtime_ns=0)
+            for index, size in enumerate(sizes)
+        ]
+
+    @staticmethod
+    def _info(max_bytes: int | None, used_bytes: int = 0, nuke: bool = False):
+        return lambda _root: RecycleInfo(max_bytes, used_bytes, nuke)
+
+    def test_headroom_consumed_in_execution_order(self) -> None:
+        rows = self._rows(60, 30, 20)  # 上限 100：前两个占满 90，第三个 20 放不下
+        permanent, recyclable = split_permanent(rows, info_for_root=self._info(100))
+        self.assertEqual([row.size_bytes for row in recyclable], [60, 30])
+        self.assertEqual([row.size_bytes for row in permanent], [20])
+
+    def test_used_bytes_shrink_headroom(self) -> None:
+        rows = self._rows(40, 20)  # 上限 100 已占用 70 → 只剩 30
+        permanent, recyclable = split_permanent(rows, info_for_root=self._info(100, used_bytes=70))
+        self.assertEqual([row.size_bytes for row in recyclable], [20])
+        self.assertEqual([row.size_bytes for row in permanent], [40])
+
+    def test_nuke_on_delete_marks_everything_permanent(self) -> None:
+        rows = self._rows(1, 2)
+        permanent, recyclable = split_permanent(rows, info_for_root=self._info(1000, nuke=True))
+        self.assertEqual(permanent, rows)
+        self.assertEqual(recyclable, [])
+
+    def test_unknown_capacity_is_conservatively_permanent(self) -> None:
+        rows = self._rows(1)
+        permanent, recyclable = split_permanent(rows, info_for_root=self._info(None))
+        self.assertEqual(permanent, rows)
+        self.assertEqual(recyclable, [])
+
+    def test_queried_once_per_volume_root(self) -> None:
+        calls: list[str] = []
+
+        def factory(root: str) -> RecycleInfo:
+            calls.append(root)
+            return RecycleInfo(100, 0, False)
+
+        split_permanent(self._rows(1, 2, 3), info_for_root=factory)
+        self.assertEqual(len(calls), 1)  # 同一卷只读一次容量事实
 
 
 class PruneEmptyDirsTests(unittest.TestCase):
